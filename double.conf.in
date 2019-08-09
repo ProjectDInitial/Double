@@ -1,0 +1,25 @@
+# A file for configured DOUBLE
+
+error_log:              @DOUBLE_ERROR_LOG@
+
+http:
+    port:               9999                        # Port to bind 
+    timeout:            5                           # Timeout for HTTP read/write
+    access_log:         @DOUBLE_ACCESS_LOG@
+    maxheadersize:      4096                        # Input request max header size
+    maxbodysize:        512000                      # Input request max body size
+
+    tcp:
+        keepalive_time:                 300
+        keepalive_intvl:                60
+        keepalive_probes:               3
+        nodelay:                        false       # Nagle option 
+
+    #ssl:            
+    #    certificate:                    ../cert/double.cert
+    #    privatekey:                     ../cert/double.pk
+
+    #partners:
+    #    -
+    #     id:                            P1
+    #     secret:                        P1secret
