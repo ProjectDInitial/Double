@@ -666,7 +666,7 @@ static int dbl_http_verify_signature_(const struct dbl_http *http, struct evkeyv
     /* Remove the element 'signature' from the form */
     signature = TAILQ_FIRST(form);
     while (signature) {
-        if (strcasecmp(signature->key, "signature") == 0) {
+        if (strcasecmp(signature->key, "token") == 0) {
             TAILQ_REMOVE(form, signature, next);
             break;
         }
@@ -680,7 +680,7 @@ static int dbl_http_verify_signature_(const struct dbl_http *http, struct evkeyv
     
     /* Find the secret from the HTTP partner list
      * by input partnerid */
-    partnerid = evhttp_find_header(form, "partnerid");
+    partnerid = evhttp_find_header(form, "partner");
     if (partnerid == NULL) {
         res = -1;
         goto done;
