@@ -1,14 +1,9 @@
 #include "dbl_cycle.h"
 #include "dbl_deamon.h"
 #include "dbl_log.h"
-#include "dbl_exchanger.h"
 
-#include <float.h>
-#include <malloc.h>
 #include <double-config.h>
-#include <memory.h>
-#include <event2/tag.h>
-#include <event2/buffer.h>
+#include <malloc.h>
 #include <openssl/ssl.h>
 
 static int dbl_get_options_(int argc, char *const *argv, const char **signame) {
@@ -46,26 +41,24 @@ int main(int argc, char **argv) {
     struct dbl_cycle *cyc, initcyc;
     const char *signame; 
     
-    if (SSL_library_init() == -1) {
-        dbl_log_writestd(DBL_LOG_ERROR, errno, "SSL_library_init() failed");
-        return 1;
-    }
-    mallopt(M_MXFAST, 0);
-
+    signame = NULL;
     initcyc.config_path = DBL_CONFIG_PATH;
     initcyc.pid_path = DBL_PID_PATH;
-
-    signame = NULL;
 
     /* Get input options */
     if (dbl_get_options_(argc, argv, &signame) == -1) {
         return 1;
     }
-
+    
     /* If get the signal name from input options, process signal */ 
     if (signame) {
         dbl_signaler_process(&initcyc, signame);
         return 0;
+    }
+    
+    if (SSL_library_init() == -1) {
+        dbl_log_writestd(DBL_LOG_ERROR, errno, "SSL_library_init() failed");
+        return 1;
     }
 
     cyc = dbl_cycle_new(&initcyc);

@@ -2,12 +2,6 @@
 #include "dbl_log.h"
 #include "dbl_exchanger.h"
 
-#include <stdlib.h>
-#include <string.h>
-#include <memory.h>
-#include <assert.h>
-#include <sys/queue.h>
-#include <netinet/tcp.h>
 #include <event2/http.h>
 #include <event2/keyvalq_struct.h>
 #include <event2/buffer.h>
@@ -16,7 +10,14 @@
 #include <openssl/md5.h>
 #include <openssl/ssl.h>
 
-#define DBL_HTTP_IPADDRSTR_ANY                           "0.0.0.0"
+#include <stdlib.h>
+#include <string.h>
+#include <memory.h>
+#include <assert.h>
+#include <sys/queue.h>
+#include <netinet/tcp.h>
+
+#define DBL_HTTP_IPADDRSTR_ANY      "0.0.0.0"
 
 #define DBL_HTTP_STATUS_MAP(XX)     \
 XX(401, "Unauthorized")             \
@@ -488,11 +489,42 @@ static int dbl_http_should_verify_signature_(const struct dbl_http *http) {
     return !TAILQ_EMPTY(&http->partners);
 }
 
+time_t strtotimet(const char *s, size_t n) {
+    time_t result;
+    long value;
+
+    if (n == 0) {
+        return -1;
+    }
+
+    result = 0;
+    while (n-- > 0) {
+        if (*s < '0' || *s > '9') {
+            return -1;
+        }
+        
+        if (result > LONG_MAX / 10) {
+            return -1;
+        }
+        
+        value = *s - '0';
+        if (result == LONG_MAX / 10 && value > LONG_MAX % 10) {
+            return -1;
+        }
+        
+        result = result * 10 + value;
+        s++;
+    }
+    return result;
+}
+
 static int dbl_http_verify_signature_(const struct dbl_http *http, struct evkeyvalq *form) {
     struct evkeyval *curr, *min, *next;
     struct evkeyval *signature;
     const char *partnerid;
     const char *secret;
+    const char *expires;
+    time_t time_expires;
     MD5_CTX md5ctx;
     unsigned char md5res[MD5_DIGEST_LENGTH];
     char md5hexstr[MD5_DIGEST_LENGTH * 2 + 1]; 
@@ -534,7 +566,7 @@ static int dbl_http_verify_signature_(const struct dbl_http *http, struct evkeyv
 
     
     /* Find the secret from the HTTP partner list
-     * by partnerid */
+     * by input partnerid */
     partnerid = evhttp_find_header(form, "partnerid");
     if (partnerid == NULL) {
         res = -1;
@@ -546,6 +578,21 @@ static int dbl_http_verify_signature_(const struct dbl_http *http, struct evkeyv
         goto done;
     }
 
+    /* Check the expires time */
+    expires = evhttp_find_header(form, "expires");
+    if (expires == NULL) {
+        res = -1;
+        goto done;
+    }
+
+    time_expires = strtotimet(expires, strlen(expires));
+    if (time_expires == -1 || 
+        time_expires < time(NULL)) 
+    {
+        res = -1;
+        goto done;
+    }
+           
 
     /* Use the 'secret' to sign(MD5) the form and compare to 'signature' */
     MD5_Init(&md5ctx);
@@ -608,7 +655,7 @@ static void dbl_http_request_event_trigger_cb_(struct evhttp_request *req, struc
     iform = NULL;
     ibodystr = NULL;
 
-    /* Get and check the content type from the input headers */
+    /* Get and check the content type from input headers */
     iheaders = evhttp_request_get_input_headers(req);
     val = evhttp_find_header(iheaders, "Content-Type");
     if (val == NULL) {
@@ -646,20 +693,20 @@ static void dbl_http_request_event_trigger_cb_(struct evhttp_request *req, struc
 
 
     if (dbl_http_should_verify_signature_(http) &&
-        dbl_http_verify_signature_(http, iform)) 
+        dbl_http_verify_signature_(http, iform) == -1) 
     {
         dbl_http_reply_401_(req);
         goto done;
     }
 
-    /* Get the event name to be triggered and use is as the route key */
+    /* Get the name of event to be triggered */ 
     val = evhttp_find_header(iform, "event");
     if (val == NULL || dbl_exchanger_routekey_parse(&dstrk, val) == -1) 
     {
         dbl_http_reply_400_(req);
         goto done;
     }
-    /* Get the event context data to be triggered and use is as message */
+    /* Get the callback data of event to be triggered */ 
     val = evhttp_find_header(iform, "data");
     if (val == NULL || strlen(val) == 0) {
         dbl_http_reply_400_(req);
@@ -692,7 +739,7 @@ static void dbl_http_request_event_listen_finally_(struct dbl_http_output_events
 static void dbl_http_request_event_listen_end_flush_eventstream_(struct evhttp_request *req, struct dbl_http_output_eventstream_context *ctx) {
     struct evhttp_connection *evconn;
     
-    /* All event data in the eventstream has been sent and 
+    /* All event datas in the eventstream has been sent and 
      * the event stream is end, means response end */ 
     if (dbl_http_eventstream_isend_(&ctx->eventstream)) {
         evhttp_send_reply_end(req);
@@ -701,7 +748,7 @@ static void dbl_http_request_event_listen_end_flush_eventstream_(struct evhttp_r
 
     evconn = evhttp_request_get_connection(req);
 
-    /* Waiting for more messages from accept queue */
+    /* Unset timeout for wait more messages */
     evhttp_connection_set_timeout(evconn, -1);
 
     /* Update flushing status */
@@ -716,9 +763,8 @@ static void dbl_http_request_event_listen_flush_eventstream_cb_(struct evhttp_co
     output = evhttp_request_get_output_buffer(ctx->request);
     
     /* Read an event data from eventstream to output buffer 
-     * to send to the client */
+     * for send to the client */
     if (dbl_http_eventstream_read_(&ctx->eventstream, output) == -1) {
-        /* All event data in the eventstream has been sent */
         dbl_http_request_event_listen_end_flush_eventstream_(ctx->request, ctx);
         return;
     }
@@ -755,7 +801,8 @@ static void dbl_http_request_event_listen_send_reply_done_(struct evhttp_request
 
     /* Now, we don't care about the connection close event */
     evhttp_connection_set_closecb(evconn, NULL, NULL);
-    /* Reset the connection timeout to receive next request */ 
+
+    /* Reset the connection timeout for receive next request */ 
     evhttp_connection_set_timeout(evconn, ctx->http->timeout);
 
     dbl_http_request_event_listen_finally_(ctx);
@@ -771,8 +818,6 @@ static void dbl_http_request_event_listen_send_reply_fail_(struct evhttp_request
      * trigger the connection close callback. 
      */
     evhttp_connection_free(evconn);
-
-    dbl_http_request_event_listen_finally_(ctx);
 }
 
 static void dbl_http_request_event_listen_send_event_(struct dbl_exchanger_acceptqueue *queue, void *data) {
@@ -966,6 +1011,13 @@ static void dbl_http_request_event_listen_cb_(struct evhttp_request *req, struct
             dbl_http_reply_400_(req);
             goto done;
         }
+    }
+    
+    if (dbl_http_should_verify_signature_(http) &&
+        dbl_http_verify_signature_(http, iform) == -1) 
+    {
+        dbl_http_reply_401_(req);
+        goto done;
     }
 
     /* Create a queue for accepte the triggered event message from exchanger */
