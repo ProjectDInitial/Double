@@ -737,22 +737,15 @@ static void dbl_http_request_event_listen_finally_(struct dbl_http_output_events
 }
 
 static void dbl_http_request_event_listen_end_flush_eventstream_(struct evhttp_request *req, struct dbl_http_output_eventstream_context *ctx) {
-    struct evhttp_connection *evconn;
-    
+    /* Update flushing status */
+    ctx->flushing = 0;
+
     /* All event datas in the eventstream has been sent and 
      * the event stream is end, means response end */ 
     if (dbl_http_eventstream_isend_(&ctx->eventstream)) {
         evhttp_send_reply_end(req);
         return;
     }
-
-    evconn = evhttp_request_get_connection(req);
-
-    /* Unset timeout for wait more messages */
-    evhttp_connection_set_timeout(evconn, -1);
-
-    /* Update flushing status */
-    ctx->flushing = 0;
 }
 
 static void dbl_http_request_event_listen_flush_eventstream_cb_(struct evhttp_connection *evconn, void *data) { 
@@ -762,12 +755,17 @@ static void dbl_http_request_event_listen_flush_eventstream_cb_(struct evhttp_co
     ctx = data;
     output = evhttp_request_get_output_buffer(ctx->request);
     
+    evhttp_connection_set_timeout(evconn, 0);
+
     /* Read an event data from eventstream to output buffer 
      * for send to the client */
     if (dbl_http_eventstream_read_(&ctx->eventstream, output) == -1) {
         dbl_http_request_event_listen_end_flush_eventstream_(ctx->request, ctx);
         return;
     }
+
+    /* Set timeout for send an event data */
+    evhttp_connection_set_timeout(evconn, ctx->http->timeout);
 
     /* Send to client */
     evhttp_send_reply_chunk_with_cb(ctx->request, output, dbl_http_request_event_listen_flush_eventstream_cb_, ctx); 
@@ -781,9 +779,6 @@ static void dbl_http_request_event_listen_start_flush_eventstream_(struct evhttp
     }
     
     evconn = evhttp_request_get_connection(req);
-
-    /* Set timeout for send event data */
-    evhttp_connection_set_timeout(evconn, ctx->http->timeout);
 
     /* Update flushing status */
     ctx->flushing = 1;
@@ -943,9 +938,8 @@ static void dbl_http_request_event_listen_start_send_reply_(struct evhttp_reques
     struct evkeyvalq *outputheaders;
     
     evconn = evhttp_request_get_connection(req);
-    /* Cancel the connection timeout for waiting messages 
-     * from accepter */
-    evhttp_connection_set_timeout(evconn, -1);
+    /* Unset timeout for wait more messages from the queue */
+    evhttp_connection_set_timeout(evconn, 0);
     evhttp_connection_set_closecb(evconn, dbl_http_request_event_listen_on_connection_closecb_, ctx);
     evhttp_request_set_on_complete_cb(req, dbl_http_request_event_listen_send_reply_done_, ctx);
     
