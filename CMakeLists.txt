@@ -10,7 +10,9 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(DOUBLE_INSTALL_PATH     ${CMAKE_INSTALL_PREFIX}/double)
+if(NOT DOUBLE_INSTALL_PATH)
+    set(DOUBLE_INSTALL_PATH     ${CMAKE_INSTALL_PREFIX}/double)
+endif()
 set(DOUBLE_PID_PATH         ${DOUBLE_INSTALL_PATH}/double.pid)
 set(DOUBLE_CONFIG_PATH      ${DOUBLE_INSTALL_PATH}/double.conf)
 
