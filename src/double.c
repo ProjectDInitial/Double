@@ -3,7 +3,6 @@
 #include "dbl_log.h"
 
 #include <double-config.h>
-#include <malloc.h>
 #include <openssl/ssl.h>
 
 static int dbl_get_options_(int argc, char *const *argv, const char **signame) {
@@ -42,8 +41,8 @@ int main(int argc, char **argv) {
     const char *signame; 
     
     signame = NULL;
-    initcyc.config_path = DBL_CONFIG_PATH;
-    initcyc.pid_path = DBL_PID_PATH;
+    initcyc.config_file = DBL_CONFIG_PATH;
+    initcyc.pid_file = DBL_PID_PATH;
 
     /* Get input options */
     if (dbl_get_options_(argc, argv, &signame) == -1) {
@@ -61,7 +60,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    cyc = dbl_cycle_new(&initcyc);
+    cyc = dbl_cycle_new(initcyc.config_file, initcyc.pid_file);
     if (cyc == NULL) {
         return 1;
     }

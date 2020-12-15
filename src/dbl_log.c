@@ -8,12 +8,10 @@
 
 #define XX(name, i) \
     #name,
-
 const char *dbl_log_level_names[] = {
     NULL,
     DBL_LOG_LEVEL_MAP(XX)
 };
-
 #undef XX
 
 void dbl_log_vwrite(FILE *log, enum dbl_log_level level, int errorno, const char *fmt, va_list args) {
@@ -24,6 +22,11 @@ void dbl_log_vwrite(FILE *log, enum dbl_log_level level, int errorno, const char
     time_t now;
     struct tm *tinfo;
 
+#ifdef NDEBUG
+    if (level == DBL_LOG_WARN) {
+        return;
+    }
+#endif
 
     p = strerrbuf;
     last = p + remain;

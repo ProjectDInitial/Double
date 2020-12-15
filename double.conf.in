@@ -1,4 +1,4 @@
-# A file for configured DOUBLE
+# A file for configured Double
 
 error_log:              @DOUBLE_ERROR_LOG@
 
@@ -14,12 +14,25 @@ http:
         keepalive_intvl:                60
         keepalive_probes:               3
         nodelay:                        false       # Nagle option 
+    
+
+    # Cross-Origin resource sharing 
+    # Only effective on request 'host:port/event/listen'
+    #
+    # NOTES:(*) is a special symbol on YAML, if you want
+    #       to allow all origins, please use ("*"),such as
+    #
+    #       origins:
+    #           - "*"
+    cors:  
+        origins:
+            - www.hosta.com
+            - www.hostb.com
 
     #ssl:            
     #    certificate:                    ../cert/double.cert
     #    privatekey:                     ../cert/double.pk
 
     #partners:
-    #    -
-    #     id:                            P1
-    #     secret:                        P1secret
+    #    - id:                           P1
+    #      secret:                       P1secret

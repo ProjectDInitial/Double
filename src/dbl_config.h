@@ -2,6 +2,7 @@
 #define __DBL_CONFIG_H
 
 #include <stdio.h>
+#include <stdint.h>
 
 struct dbl_config {
     const char                                     *error_log_path;
@@ -9,7 +10,7 @@ struct dbl_config {
 };
 
 struct dbl_config_http {
-    unsigned short                                  port;
+    uint16_t                                        port;
     int                                             timeout;
     const char                                     *access_log_path;
     int                                             maxheadersize;
@@ -17,6 +18,7 @@ struct dbl_config_http {
 
     const struct dbl_config_http_ssl               *ssl;
     const struct dbl_config_http_tcp               *tcp;
+    const struct dbl_config_http_cors              *cors;
     const struct dbl_config_http_partner           *partners;
     int                                             partners_count;
 };
@@ -36,6 +38,11 @@ struct dbl_config_http_ssl {
 struct dbl_config_http_partner {
     const char                                     *id;
     const char                                     *secret;
+};
+
+struct dbl_config_http_cors {
+    const char                                    **origins;
+    int                                             origins_count;
 };
 
 

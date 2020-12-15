@@ -1,5 +1,6 @@
 #include "dbl_http.h"
 #include "dbl_log.h"
+#include "dbl_string.h"
 #include "dbl_exchanger.h"
 
 #include <event2/http.h>
@@ -7,17 +8,14 @@
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
 #include <event2/bufferevent_ssl.h>
+#include <event2/listener.h>
 #include <openssl/md5.h>
 #include <openssl/ssl.h>
 
 #include <stdlib.h>
-#include <string.h>
 #include <memory.h>
 #include <assert.h>
 #include <sys/queue.h>
-#include <netinet/tcp.h>
-
-#define DBL_HTTP_IPADDRSTR_ANY      "0.0.0.0"
 
 #define DBL_HTTP_STATUS_MAP(XX)     \
 XX(401, "Unauthorized")             \
@@ -37,18 +35,20 @@ DBL_HTTP_STATUS_MAP(XX)
 #undef XX
 
 struct dbl_http {
+    struct event_base                                  *evbase;
+
     /* A http service on the event loop */
     struct evhttp                                      *evhttp;
 
-    /* SSL for HTTP, NULL on disabled */
+    /* SSL context */ 
     SSL_CTX                                            *sslctx;
+
+    /* SSL for HTTP, NULL on disabled */
+    SSL                                                *ssl;
     
     /* A log file for record the request from client */
     FILE                                               *access_log;
 
-    /* A log file for record the running error on the http service */
-    FILE                                               *error_log;
-    
     /* A timeout for:
      * 1. HTTP read/write  
      * 2. Send an event data of eventstream 
@@ -66,17 +66,14 @@ struct dbl_http {
      * the signature from the partner
      * */
     struct evkeyvalq                                    partners;
+
+
+    /* Cross-Origin resource sharing */
+    TAILQ_HEAD(, dbl_cors_origin)                       cors_origins;
+
+    /* When add '*' to cors origins, 'cors_origins_allowall' is 1 */
+    int                                                 cors_origins_allowall;
 };
-
-
-/**
- * @brief evbuffer entry
- */
-struct dbl_evbuffer_entry {
-    struct evbuffer                                    *buffer;
-    TAILQ_ENTRY(dbl_evbuffer_entry)                     next;
-};
-
 
 struct dbl_http_evenstream {
     TAILQ_HEAD(, dbl_http_eventdata_entry)      eventdataq;
@@ -88,7 +85,7 @@ struct dbl_http_evenstream {
 
 struct dbl_http_eventdata_entry {
     struct evbuffer                            *data;
-    TAILQ_ENTRY(dbl_http_eventdata_entry)      next;
+    TAILQ_ENTRY(dbl_http_eventdata_entry)       next;
 };
 
 /**
@@ -115,39 +112,54 @@ struct dbl_http_output_eventstream_context {
     TAILQ_ENTRY(dbl_http_output_eventstream_context)   next;
 };
 
+struct dbl_cors_origin {
+    char                                       *origin;
+    TAILQ_ENTRY(dbl_cors_origin)                next;
+};
+
 struct dbl_http_action {
     const char             *path;
 
     void                  (*handler)(struct evhttp_request*, struct dbl_http*);
 
-    int                     metheds_allowed;
+    /* The methods allowed */
+    int                     metheds_allowed;    
+
+    int                     cors_allowed;
 };
 
 static void dbl_http_request_home_cb_(struct evhttp_request *request, struct dbl_http *http);
 static void dbl_http_request_event_trigger_cb_(struct evhttp_request *request, struct dbl_http *http); 
 static void dbl_http_request_event_listen_cb_(struct evhttp_request *request, struct dbl_http *http);
-static struct bufferevent *dbl_http_bevcb_(struct event_base *evbase, void *data);
-static void dbl_http_gencb_(struct evhttp_request *request, void *data); 
+static struct bufferevent *dbl_http_new_bufferevent_socket_(struct event_base *evbase, void *data);
+static struct bufferevent *dbl_http_new_bufferevent_ssl_(struct event_base *evbase, void *data);
+static void dbl_http_process_request_(struct evhttp_request *request, void *data); 
+static void dbl_http_process_request_after_log_(struct evhttp_request *request, void *data);
+static int dbl_http_make_cors_headers_(const struct dbl_http *http, struct evhttp_request *request); 
 
 const struct dbl_http_action default_actionlist[] = {
     {
         "/",
         dbl_http_request_home_cb_,
         EVHTTP_REQ_GET,
+        0,
     },
     {
         "/event/listen",
         dbl_http_request_event_listen_cb_,
-        EVHTTP_REQ_GET
+        EVHTTP_REQ_GET,
+        1,
     },
     {
         "/event/trigger",
         dbl_http_request_event_trigger_cb_,
         EVHTTP_REQ_POST,
+        0,
     },
     {
         NULL,
         NULL,
+        0,
         0,
     }
 };
@@ -231,7 +243,6 @@ static int dbl_http_eventstream_isend_(const struct dbl_http_evenstream *evstrea
     return evstream->isend;
 }
 
-
 static struct dbl_http_output_eventstream_context *dbl_http_output_eventstream_context_new_(struct dbl_http *http, struct evhttp_request *req, struct dbl_exchanger_acceptqueue *accepter) {
     struct dbl_http_output_eventstream_context *ctx;
 
@@ -253,198 +264,268 @@ static void dbl_http_output_eventstream_context_free_(struct dbl_http_output_eve
     free(ctx);
 }
 
-struct dbl_http *dbl_http_start(struct event_base *evbase, const struct dbl_config_http *config) {
-    struct dbl_http *http = NULL; 
-
-    struct evhttp *evhttp = NULL;
-    struct dbl_exchanger *exchanger = NULL;
-    SSL_CTX *sslctx = NULL;
-    FILE *accesslog = NULL;
-    struct evkeyvalq partners = TAILQ_HEAD_INITIALIZER(partners);
-
-    struct evhttp_bound_socket *bdsock;
-    int sockfd;
-
+struct dbl_http *dbl_http_new(struct event_base *evbase) {
+    struct dbl_http *http;
+    struct evhttp *evhttp;
+    SSL_CTX *sslctx;
+    struct dbl_exchanger *exchanger;
 
     http = malloc(sizeof(struct dbl_http));
     if (http == NULL) {
-        goto error;
-    }
-    memset(http, 0, sizeof(struct dbl_http));
-
-
-    exchanger = dbl_exchanger_new(evbase);
-    if (exchanger == NULL) {
-        goto error;
+        return NULL;
     }
 
 
     evhttp = evhttp_new(evbase);
     if (evhttp == NULL) {
-        goto error;
-    }
-    evhttp_set_gencb(evhttp, dbl_http_gencb_, http);
-    evhttp_set_bevcb(evhttp, dbl_http_bevcb_, http);
-    evhttp_set_default_content_type(evhttp, "text/html; charset=UTF-8");
-    evhttp_set_timeout(evhttp, config->timeout);
-    evhttp_set_max_headers_size(evhttp, config->maxheadersize);
-    evhttp_set_max_body_size(evhttp, config->maxbodysize);
-
-
-    /* Bind to the specified port */
-    bdsock = evhttp_bind_socket_with_handle(evhttp, DBL_HTTP_IPADDRSTR_ANY, config->port);
-    if (bdsock == NULL) {
-        dbl_log_writestd(DBL_LOG_ERROR, errno, "bind %s:%d failed", DBL_HTTP_IPADDRSTR_ANY, config->port);
-        goto error;
-    }
-
-
-    /* Set tcp options for bound socket */
-    if (config->tcp) {
-        sockfd = evhttp_bound_socket_get_fd(bdsock);
-        if (config->tcp->keepalive_time && setsockopt(sockfd, SOL_TCP, TCP_KEEPIDLE, config->tcp->keepalive_time, sizeof(int)) == -1) {
-            dbl_log_writestd(DBL_LOG_ERROR, errno, "setsockopt TCP_KEEPIDLE \"%d\" failed", config->tcp->keepalive_time);
-            goto error;
-        }
-        if (config->tcp->keepalive_intvl && setsockopt(sockfd, SOL_TCP, TCP_KEEPINTVL, config->tcp->keepalive_intvl, sizeof(int))== -1) {
-            dbl_log_writestd(DBL_LOG_ERROR, errno, "setsockopt TCP_KEEPINTVL \"%d\" failed", config->tcp->keepalive_intvl);
-            goto error;
-        }
-        if (config->tcp->keepalive_probes && setsockopt(sockfd, SOL_TCP, TCP_KEEPCNT, config->tcp->keepalive_probes, sizeof(int)) == -1) {
-            dbl_log_writestd(DBL_LOG_ERROR, errno, "setsockopt TCP_KEEPCNT \"%d\" failed", config->tcp->keepalive_probes);
-            goto error;
-        }
-        if (config->tcp->nodelay && setsockopt(sockfd, SOL_TCP, TCP_NODELAY, config->tcp->nodelay, sizeof(int)) == -1) {
-            dbl_log_writestd(DBL_LOG_ERROR, errno, "setsockopt TCP_NODELAY \"%d\" failed", config->tcp->nodelay);
-            goto error;
-        }
-    }
-
-
-    /* Initialize SSL for HTTP service */
-    if (config->ssl) {
-        sslctx = SSL_CTX_new(SSLv23_method());
-        if (sslctx == NULL) {
-            goto error;
-        }
-        if (!SSL_CTX_use_certificate_file(sslctx, config->ssl->certificate, SSL_FILETYPE_PEM)) {
-            dbl_log_writestd(DBL_LOG_ERROR, errno, "Load SSL certificate failed \"%s\"", config->ssl->certificate);
-            goto error;
-        }
-        if (!SSL_CTX_use_RSAPrivateKey_file(sslctx, config->ssl->privatekey, SSL_FILETYPE_PEM)) {
-            dbl_log_writestd(DBL_LOG_ERROR, errno, "Load SSL RSA-privatekey failed \"%s\"", config->ssl->privatekey);
-            goto error;
-        }
-        if (!SSL_CTX_check_private_key(sslctx)) {
-            dbl_log_writestd(DBL_LOG_ERROR, 0, "SSL RSA-privatekey is invalid");
-            goto error;
-        }
-    }
-
-
-    /* Initialize access log file for HTTP service */
-    if (config->access_log_path) {
-        accesslog = fopen(config->access_log_path, "a");
-        if (accesslog == NULL) {
-            dbl_log_writestd(DBL_LOG_ERROR, errno, "open access log file \"%s\" failed", config->access_log_path);
-            goto error;
-        }
-    }
-    
-
-    /* Set access partners for HTTP service */
-    if (config->partners) {
-        for (int i = 0; i < config->partners_count; i++) {
-            if (evhttp_add_header(&partners, config->partners[i].id, config->partners[i].secret) == -1) {
-                goto error;
-            }
-        }
-    }
-
-    http->evhttp = evhttp;
-    http->exchanger = exchanger;
-    http->error_log = NULL;
-    http->access_log = accesslog;
-    http->sslctx = sslctx;
-    http->timeout = config->timeout;
-    TAILQ_INIT(&http->partners);
-    TAILQ_CONCAT(&http->partners, &partners, next);
-    return http;
-
-error:
-    if (http) {
         free(http);
+        return NULL;
     }
-    if (evhttp) {
-        evhttp_free(evhttp);
-    }
-    if (exchanger) {
-        dbl_exchanger_free(exchanger);
-    }
-    if (sslctx) {
-        SSL_CTX_free(sslctx);
-    }
-    if (accesslog) {
-        fclose(accesslog);
-    }
-    evhttp_clear_headers(&partners);
+    evhttp_set_gencb(evhttp, dbl_http_process_request_, http);
+    evhttp_set_bevcb(evhttp, dbl_http_new_bufferevent_socket_, http);
+    evhttp_set_default_content_type(evhttp, "text/html; charset=UTF-8");
 
-    return NULL;
+
+    sslctx = SSL_CTX_new(SSLv23_server_method());
+    if (sslctx == NULL) {
+        free(http);
+        evhttp_free(evhttp);
+        return NULL;
+    }
+
+    
+    exchanger = dbl_exchanger_new(evbase);
+    if (exchanger == NULL) {
+        free(http);
+        evhttp_free(evhttp);
+        SSL_CTX_free(sslctx);
+        return NULL;
+    }
+
+
+    memset(http, 0, sizeof(struct dbl_http));
+    http->evhttp = evhttp;
+    http->sslctx = sslctx;
+    http->exchanger = exchanger;
+    http->evbase = evbase;
+    TAILQ_INIT(&http->partners);
+    TAILQ_INIT(&http->cors_origins);
+
+    return http;
 }
 
-void dbl_http_close(struct dbl_http *http) {
+
+void dbl_http_free(struct dbl_http *http) {
+    dbl_http_disable_ssl(http);
+    dbl_http_disable_accesslog(http);
+    dbl_http_clear_partners(http);
+    dbl_http_clear_cors_origins(http);
     evhttp_free(http->evhttp);
-    if (http->sslctx) {
-        SSL_CTX_free(http->sslctx);
-    }
-    if (http->access_log) {
-        fclose(http->access_log);
-    }
     dbl_exchanger_free(http->exchanger);
-    evhttp_clear_headers(&http->partners);
+    SSL_CTX_free(http->sslctx);
     free(http);
 }
 
-static void dbl_http_logreq_(FILE *accesslog, struct evhttp_request *req) {
-    struct evhttp_connection *conn;
-    char *caddr;
-    uint16_t cport;
+int dbl_http_bind(struct dbl_http *http, uint32_t ipv4, uint16_t port) {
+    struct evconnlistener *listener;
+    struct evhttp_bound_socket *bdsock;
+    struct sockaddr_in addr;
+    
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_addr.s_addr = htons(ipv4);
+    addr.sin_port = htons(port);
+    addr.sin_family = AF_INET;
 
-    /* Get the connection of the request */
-    conn = evhttp_request_get_connection(req);
-    /* Get the client address and port of the connection */
-    evhttp_connection_get_peer(conn, &caddr, &cport);
-    /* Write into the file */
-    dbl_log_write(accesslog, DBL_LOG_INFO, 0, "%s:%d - %s", caddr, cport, evhttp_request_get_uri(req)); 
+    listener = evconnlistener_new_bind(http->evbase, NULL, NULL, 
+            LEV_OPT_REUSEABLE|LEV_OPT_CLOSE_ON_FREE|LEV_OPT_DEFERRED_ACCEPT,
+            128, 
+            (void *)&addr, 
+            sizeof(addr));
+
+    if (listener == NULL) {
+        dbl_log_writestd(DBL_LOG_ERROR, errno, "bind %s:%d failed", addr, port);
+        return -1;
+    }
+
+    bdsock = evhttp_bind_listener(http->evhttp, listener);
+    if (bdsock == NULL) {
+        evconnlistener_free(listener);
+        return -1;
+    }
+
+    return evhttp_bound_socket_get_fd(bdsock);
 }
 
-static struct bufferevent *dbl_http_bufevssl_new_(struct event_base *evbase, SSL_CTX *sslctx) {
-    struct bufferevent *bufev;
+void dbl_http_set_max_headers_size(struct dbl_http *http, int size) {
+    evhttp_set_max_headers_size(http->evhttp, size);
+}
+
+void dbl_http_set_max_body_size(struct dbl_http *http, int size) {
+    evhttp_set_max_body_size(http->evhttp, size);
+}
+
+void dbl_http_set_timeout(struct dbl_http *http, int timeout) {
+    evhttp_set_timeout(http->evhttp, timeout);
+}
+
+int dbl_http_add_cors_origin(struct dbl_http *http, const char *origin) {
+    struct dbl_cors_origin *entry;
+
+    entry = malloc(sizeof(struct dbl_cors_origin));
+    if (entry == NULL) {
+        return -1;
+    }
+    
+    entry->origin = strdup(origin);
+    if (entry->origin == NULL) {
+        free(entry);
+        return -1;
+    }
+
+    if (strcmp(entry->origin, "*") == 0) {
+        http->cors_origins_allowall = 1;
+    }
+
+    TAILQ_INSERT_TAIL(&http->cors_origins, entry, next);
+    return 0;
+}
+
+void dbl_http_clear_cors_origins(struct dbl_http *http) {
+    struct dbl_cors_origin *n;
+
+    while ((n = TAILQ_FIRST(&http->cors_origins))) {
+        TAILQ_REMOVE(&http->cors_origins, n, next);
+        free(n->origin);
+        free(n);
+    }
+    http->cors_origins_allowall = 0;
+}
+
+int dbl_http_add_partner(struct dbl_http *http, const char *partnerid, const char *secret) {
+    if (evhttp_find_header(&http->partners, partnerid) != NULL) {
+        return -1;
+    }
+    return evhttp_add_header(&http->partners, partnerid, secret);
+}
+
+void dbl_http_clear_partners(struct dbl_http *http) {
+    evhttp_clear_headers(&http->partners);
+}
+
+int dbl_http_enable_ssl(struct dbl_http *http, const char *certificate, const char *privatekey) {
     SSL *ssl;
+    SSL *old = NULL;
 
-    ssl = SSL_new(sslctx);
+    if (http->ssl) {
+        old = http->ssl;
+    }
+
+    ssl = SSL_new(http->sslctx);
     if (ssl == NULL) {
-        return NULL;
+        goto error;
+    }
+    if (!SSL_use_certificate_file(ssl, certificate, SSL_FILETYPE_PEM)) {
+        dbl_log_writestd(DBL_LOG_ERROR, errno, "Load SSL certificate failed \"%s\"", certificate);
+        goto error;
+    }
+    if (!SSL_use_RSAPrivateKey_file(ssl, privatekey, SSL_FILETYPE_PEM)) {
+        dbl_log_writestd(DBL_LOG_ERROR, errno, "Load SSL RSA-privatekey failed \"%s\"", privatekey);
+        goto error;
+    }
+    if (!SSL_check_private_key(ssl)) {
+        dbl_log_writestd(DBL_LOG_ERROR, 0, "SSL RSA-privatekey is invalid");
+        goto error;
     }
 
-    bufev = bufferevent_openssl_socket_new(evbase, -1, ssl, BUFFEREVENT_SSL_ACCEPTING, BEV_OPT_CLOSE_ON_FREE);
-    if (bufev == NULL) {
-        SSL_free(ssl);
-        return NULL;
+    http->ssl = ssl;
+    if (old) {
+        SSL_free(old);
     }
-    return bufev;
+
+    evhttp_set_bevcb(http->evhttp, dbl_http_new_bufferevent_ssl_, NULL);
+    return 0;
+
+error:
+    http->ssl = old;
+    if (ssl) {
+        SSL_free(ssl);
+    }
+    return -1;
 }
 
-static struct bufferevent *dbl_http_bevcb_(struct event_base *evbase, void *ctx){
-    struct dbl_http *http = ctx;
-
-    if (http->sslctx) {
-        return dbl_http_bufevssl_new_(evbase, http->sslctx);
+void dbl_http_disable_ssl(struct dbl_http *http) {
+    if (http->ssl == NULL) {
+        return;
     }
+
+    SSL_free(http->ssl);
+    http->ssl = NULL;
+    evhttp_set_bevcb(http->evhttp, dbl_http_new_bufferevent_socket_, NULL);
+}
+
+int dbl_http_enable_accesslog(struct dbl_http *http, const char *accesslog) {
+    FILE *log;
+    FILE *old = NULL;
+
+    if (http->access_log) {
+        old = http->access_log;
+    }
+
+    log = fopen(accesslog, "a");
+    if (log == NULL) {
+        dbl_log_writestd(DBL_LOG_ERROR, errno, "open access log file \"%s\" failed", accesslog); 
+        goto error;
+    }
+
+    http->access_log = log;
+    if (old) {
+        fclose(old);
+    }
+
+    evhttp_set_gencb(http->evhttp, dbl_http_process_request_after_log_, http);
+    return 0;
+
+error:
+    http->access_log = old;
+    return -1;
+}
+
+void dbl_http_disable_accesslog(struct dbl_http *http) {
+    if (http->access_log == NULL) {
+        return;
+    }
+
+    fclose(http->access_log);
+    http->access_log = NULL;
+    evhttp_set_gencb(http->evhttp, dbl_http_process_request_, http);
+}
+
+static struct bufferevent *dbl_http_new_bufferevent_socket_(struct event_base *evbase, void *data) {
     return bufferevent_socket_new(evbase, -1, 0);
 }
 
-static void dbl_http_gencb_(struct evhttp_request *req, void *data) {
+static struct bufferevent *dbl_http_new_bufferevent_ssl_(struct event_base *evbase, void *data) {
+    struct bufferevent *bev;
+    struct dbl_http *http;
+    SSL *ssl;
+
+    http = data;
+    ssl = SSL_dup(http->ssl);
+    if (ssl == NULL) {
+        dbl_log_writestd(DBL_LOG_ERROR, errno, "SSL_dup() failed"); 
+        return NULL;
+    }
+
+    bev = bufferevent_openssl_socket_new(evbase, -1, ssl, BUFFEREVENT_SSL_ACCEPTING, BEV_OPT_CLOSE_ON_FREE);
+    if (bev == NULL) {
+        SSL_free(ssl);
+        dbl_log_writestd(DBL_LOG_ERROR, errno, "bufferevent_openssl_socket_new() failed"); 
+        return NULL;
+    }
+    return bev;
+}
+
+static void dbl_http_process_request_(struct evhttp_request *req, void *data) {
     struct dbl_http *http;
     struct evkeyvalq *oheaders;
     const struct evhttp_uri *uri;
@@ -453,12 +534,7 @@ static void dbl_http_gencb_(struct evhttp_request *req, void *data) {
 
     http = data;
 
-    /* Log client request */ 
-    if (http->access_log) {
-        dbl_http_logreq_(http->access_log, req);
-    }
-
-    /* Set default info for output headers */ 
+    /* Set default headers */ 
     oheaders = evhttp_request_get_output_headers(req);
     if (evhttp_add_header(oheaders, "Server", "double") != 0) {
         dbl_http_reply_503_(req);
@@ -474,48 +550,85 @@ static void dbl_http_gencb_(struct evhttp_request *req, void *data) {
             break;
         }
     }
+    /* Http action not found */
     if (action->handler == NULL) {
         dbl_http_reply_404_(req);
         return;
     }
+
+    /* Check the request method is allowed */
     if (!(action->metheds_allowed & evhttp_request_get_command(req))) {
         dbl_http_reply_405_(req);
         return;
     }
+
+    /* Make cors headers if cors allowed */
+    if (action->cors_allowed) { 
+        if (dbl_http_make_cors_headers_(http, req) == -1) {
+            dbl_http_reply_405_(req);
+            return;
+        }
+    }
+
     action->handler(req, http);
+}
+
+static void dbl_http_process_request_after_log_(struct evhttp_request *request, void *data) {
+    struct dbl_http *http;
+    struct evhttp_connection *evconn;
+    char *client_addr;
+    uint16_t client_port;
+
+    http = data;
+
+    evconn = evhttp_request_get_connection(request);
+    /* Get the client address and port from the connection of the request */
+    evhttp_connection_get_peer(evconn, &client_addr, &client_port);
+
+    /* Write into access log file */
+    dbl_log_write(http->access_log, DBL_LOG_INFO, 0, "%s:%d - %s", client_addr, client_port, evhttp_request_get_uri(request));
+
+    /* Process request */
+    dbl_http_process_request_(request, data);
+}
+
+static int dbl_http_make_cors_headers_(const struct dbl_http *http, struct evhttp_request *request) {
+    struct evkeyvalq *iheaders;
+    struct evkeyvalq *oheaders;
+    const char *origin;
+    struct dbl_cors_origin *entry; 
+
+    if (http->cors_origins_allowall == 0 &&
+        TAILQ_EMPTY(&http->cors_origins)) 
+    {
+        return 0;
+    }
+
+    oheaders = evhttp_request_get_output_headers(request);
+    if (http->cors_origins_allowall) {
+        return evhttp_add_header(oheaders, "Access-Control-Allow-Origin", "*");
+    }
+
+    iheaders = evhttp_request_get_input_headers(request);
+    origin = evhttp_find_header(iheaders, "origin");
+    if (origin == NULL) {
+        return 0;
+    }
+
+    TAILQ_FOREACH(entry, &http->cors_origins, next) {
+        if (strcasecmp(entry->origin, origin) == 0) {
+            break;
+        }
+    }
+
+    if (entry) {
+        return evhttp_add_header(oheaders, "Access-Control-Allow-Origin", entry->origin);
+    }
+    return 0;
 }
 
 static int dbl_http_should_verify_signature_(const struct dbl_http *http) {
     return !TAILQ_EMPTY(&http->partners);
-}
-
-time_t strtotimet(const char *s, size_t n) {
-    time_t result;
-    long value;
-
-    if (n == 0) {
-        return -1;
-    }
-
-    result = 0;
-    while (n-- > 0) {
-        if (*s < '0' || *s > '9') {
-            return -1;
-        }
-        
-        if (result > LONG_MAX / 10) {
-            return -1;
-        }
-        
-        value = *s - '0';
-        if (result == LONG_MAX / 10 && value > LONG_MAX % 10) {
-            return -1;
-        }
-        
-        result = result * 10 + value;
-        s++;
-    }
-    return result;
 }
 
 static int dbl_http_verify_signature_(const struct dbl_http *http, struct evkeyvalq *form) {
@@ -585,7 +698,7 @@ static int dbl_http_verify_signature_(const struct dbl_http *http, struct evkeyv
         goto done;
     }
 
-    time_expires = strtotimet(expires, strlen(expires));
+    time_expires = dbl_atott(expires, strlen(expires));
     if (time_expires == -1 || 
         time_expires < time(NULL)) 
     {

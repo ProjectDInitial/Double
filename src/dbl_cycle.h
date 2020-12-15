@@ -7,10 +7,10 @@
 
 struct dbl_cycle {
     /* Config file path */
-    char                               *config_path;    /* Public */
+    char                               *config_file;    /* Public */
 
     /* Pid file path */
-    char                               *pid_path;       /* Public */
+    char                               *pid_file;       /* Public */
 
     /* Event loop base */
     struct event_base                  *evbase;
@@ -20,14 +20,12 @@ struct dbl_cycle {
 
     /* HTTP service */
     struct dbl_http                    *http; 
-
-    /* A pointer to error log file */
-    FILE                               *error_log;
     
-    struct dbl_config                  *config;
+    /* Error log file */
+    FILE                               *log;
 };
 
-struct dbl_cycle *dbl_cycle_new(const struct dbl_cycle *initcyc);
+struct dbl_cycle *dbl_cycle_new(const char *configfile, const char *pidfile); 
 void dbl_cycle_free(struct dbl_cycle *cyc);
 void dbl_signaler_process(struct dbl_cycle *cyc, const char *signame); 
 void dbl_master_process(struct dbl_cycle *cyc);
