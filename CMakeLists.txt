@@ -2,70 +2,74 @@ cmake_minimum_required(VERSION 3.1.2 FATAL_ERROR)
 
 project(double VERSION 1.0) 
 include(CheckSymbolExists)
+include(CheckIncludeFile)
 
 option(BUILD_TESTING OFF)
-set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+#set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
 if(NOT DOUBLE_INSTALL_PATH)
-    set(DOUBLE_INSTALL_PATH     ${CMAKE_INSTALL_PREFIX}/double)
+    set(DOUBLE_INSTALL_PATH ${CMAKE_INSTALL_PREFIX}/double)
 endif()
+
 set(DOUBLE_PID_PATH         ${DOUBLE_INSTALL_PATH}/double.pid)
 set(DOUBLE_CONFIG_PATH      ${DOUBLE_INSTALL_PATH}/double.conf)
+set(DOUBLE_ERRORLOG_PATH    ${DOUBLE_INSTALL_PATH}/error.log)
+set(DOUBLE_ACCESSLOG_PATH   ${DOUBLE_INSTALL_PATH}/access.log)
 
-# If error log file is not specified
-if(NOT DOUBLE_ERROR_LOG)
-    set(DOUBLE_ERROR_LOG ${DOUBLE_INSTALL_PATH}/error.log)
+check_symbol_exists(__GNU_LIBRARY__ "features.h" DOUBLE_HAVE_GLIBC)
+if (NOT DOUBLE_HAVE_GLIBC)
+    list(APPEND DOUBLE_COMPILE_DEFINES _POSIX_C_SOURCE=200809L)
+    set(CMAKE_REQUIRED_DEFINITIONS -D _POSIX_C_SOURCE=200809L)
+else()
+    list(APPEND DOUBLE_COMPILE_DEFINES _GNU_SOURCE=1) 
+    set(CMAKE_REQUIRED_DEFINITIONS -D _GNU_SOURCE=1)
 endif()
 
-# If access log file is not specified
-if(NOT DOUBLE_ACCESS_LOG)
-    set(DOUBLE_ACCESS_LOG ${DOUBLE_INSTALL_PATH}/access.log)
-endif()
+check_include_file(sys/queue.h DOUBLE_HAVE_SYS_QUEUE_H)
+check_symbol_exists(strcasecmp "string.h" DOUBLE_HAVE_STRCASECMP)
+check_symbol_exists(strsep "string.h" DOUBLE_HAVE_STRSEP)
 
-
-check_symbol_exists(__GNU_LIBRARY__ "features.h" DOUBLE_HAVE_GNULIBC)
-if (NOT DOUBLE_HAVE_GNULIBC)
-    message(FATAL_ERROR "The C runtime library is not GNU C library")
-endif()
-add_compile_definitions(_GNU_SOURCE=1)
-
-# Use ISO C99
-add_compile_options(-std=c99)
-
-
-# Generate the configure header 
+# Generate the configure header file 
 configure_file(
-    ${PROJECT_SOURCE_DIR}/src/double-config.h.in
-    ${PROJECT_BINARY_DIR}/include/double-config.h
-)
+    ${PROJECT_SOURCE_DIR}/dbl_autoconfig.h.cmake
+    ${PROJECT_BINARY_DIR}/include/dbl_autoconfig.h)
 
 # Generate the application configure file 
 configure_file(
-    ${PROJECT_SOURCE_DIR}/double.conf.in
-    ${PROJECT_BINARY_DIR}/double.conf
-    )
+    ${PROJECT_SOURCE_DIR}/config.yaml.cmake
+    ${PROJECT_BINARY_DIR}/double.conf)
 
 # Generate the application 
 aux_source_directory(src PROJECT_SOURCE_FILES)
-add_executable(double ${PROJECT_SOURCE_FILES}) 
-# include configure header
-target_include_directories(double 
-    PRIVATE "${PROJECT_BINARY_DIR}/include")
 
-# Add third-party dependent libraries
+add_executable(double ${PROJECT_SOURCE_FILES}) 
+target_compile_options(double 
+    PRIVATE -std=c99 -Wall) 
+
+target_compile_definitions(double
+    PRIVATE ${DOUBLE_COMPILE_DEFINES})
+
+target_include_directories(double 
+    PRIVATE
+    "src/"
+    "${PROJECT_BINARY_DIR}/include")
+
+# Third party libraries
 add_subdirectory(thirdparty)
 target_link_libraries(double
-    PRIVATE ssl event cyaml)
-
+    PRIVATE
+    ssl
+    event
+    yaml)
 
 install(
     FILES 
     ${CMAKE_CURRENT_BINARY_DIR}/double.conf
-    DESTINATION "${DOUBLE_INSTALL_PATH}"
+    DESTINATION ${DOUBLE_INSTALL_PATH}
     )
 
 install(

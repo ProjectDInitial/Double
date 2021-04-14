@@ -1,7 +1,7 @@
 # Double
-A HTTP remote event service, client can listen/trigger the specified event on the service by HTTP protocol. make HTTP server push easier.
+A HTTP remote event service, client can listen or trigger the specified event on the service by HTTP protocol. make HTTP server push easier.
 
-**NOTES: Double is written in GNU C, just support for UNIX**
+**NOTES: Double depend POISX**
 
 ## 1. BUILDING AND INSTALLATION
 
@@ -25,7 +25,7 @@ A HTTP remote event service, client can listen/trigger the specified event on th
 The following 'Double' specific CMake variables are as follows
 ```
   # Libevent binary directory
-  DOUBLE_LIBEVENT_LIBRARY_DIR 
+  DOUBLE_LIBEVENT_BINARY_DIR 
   
   # Libevent include directory
   DOUBLE_LIBEVENT_INCLUDE_DIR

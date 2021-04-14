@@ -11,7 +11,7 @@
 int dbl_deamon() {
     switch (fork()) {
         case -1:
-            dbl_log_writestd(DBL_LOG_ERROR, errno, "fork() failed");
+            //dbl_log_writestd(DBL_LOG_ERROR, errno, "fork() failed");
             return -1;
 
         case 0:
@@ -22,7 +22,7 @@ int dbl_deamon() {
     }
     
     if (setsid() == -1) {
-        dbl_log_writestd(DBL_LOG_ERROR, errno, "setid() failed");
+        //dbl_log_writestd(DBL_LOG_ERROR, errno, "setid() failed");
         return -1;
     }
 

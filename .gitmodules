@@ -1,0 +1,4 @@
+[submodule "lib/libevent"]
+	path = lib/libevent
+	url = https://github.com/libevent/libevent.git
+	branch = release-2.1.10-stable
