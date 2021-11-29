@@ -1,104 +1,79 @@
-cmake_minimum_required(VERSION 3.1.2)
+set(LIBYAML_RESOURCE_DIR        ${CMAKE_CURRENT_LIST_DIR}/libyaml)
+set(LIBHTTP_PARSER_RESOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/libhttp_parser)
 
-# LIBYAML
-set(LIBYAML_DIR ${CMAKE_CURRENT_SOURCE_DIR}/libyaml)
-aux_source_directory(${LIBYAML_DIR}/src LIBYAML_SOURCE_FILES)
-
+# libyaml v0.2.5
+aux_source_directory(${LIBYAML_RESOURCE_DIR}/src LIBYAML_SOURCE_FILES)
 add_library(yaml STATIC ${LIBYAML_SOURCE_FILES})
 target_include_directories(yaml
-    PUBLIC ${LIBYAML_DIR}/include)
+    PUBLIC ${LIBYAML_RESOURCE_DIR}/include)
 target_compile_definitions(yaml
     PRIVATE HAVE_CONFIG_H)
 
+# nodejs/http-parser v2.9.4
+add_library(http_parser STATIC ${LIBHTTP_PARSER_RESOURCE_DIR}/http_parser.c)
+target_include_directories(http_parser
+    PUBLIC ${LIBHTTP_PARSER_RESOURCE_DIR})
+target_compile_definitions(http_parser
+    PRIVATE HTTP_PARSER_STRICT=0    #Compile with -DHTTP_PARSER_STRICT=0 to make less checks, but run faster 
+    PRIVATE HTTP_MAX_HEADER_SIZE=0x7fffffff)
 
-## LIBCYAML
-#set(LIBCYAML_DIR ${CMAKE_CURRENT_SOURCE_DIR}/libcyaml)
-#aux_source_directory(${LIBCYAML_DIR}/src LIBCYAML_SOURCE_FILES)
-#
-#add_library(cyaml STATIC ${LIBCYAML_SOURCE_FILES})
-#target_compile_definitions(cyaml
-#    PRIVATE VERSION_MAJOR=1
-#    PRIVATE VERSION_MINOR=1
-#    PRIVATE VERSION_PATCH=0
-#)
-## Dependency libyaml
-#target_link_libraries(cyaml 
-#    PUBLIC yaml)
-#target_include_directories(cyaml
-#    PUBLIC ${LIBCYAML_DIR}/include)
+# Openssl
+find_package(OpenSSL REQUIRED)
+add_library(ssl INTERFACE) 
+target_link_libraries(ssl
+    INTERFACE ${OPENSSL_SSL_LIBRARY})
+target_include_directories(ssl
+    INTERFACE ${OPENSSL_INCLUDE_DIR})
+add_library(crypto INTERFACE)
+target_link_libraries(crypto
+    INTERFACE ${OPENSSL_CRYPTO_LIBRARY})
+target_include_directories(crypto
+    INTERFACE ${OPENSSL_INCLUDE_DIR})
 
-
-# LIBEVENT 
+# libevent (version >= 2.1.10) 
 add_library(event INTERFACE)
-
-if (DOUBLE_LIBEVENT_BINARY_DIR AND DOUBLE_LIBEVENT_INCLUDE_DIR)
-    # libevent core and extra 
-    find_library(libevent_shared
-        NAMES libevent.so 
+if (DOUBLE_LIBEVENT_INCLUDE_DIR AND DOUBLE_LIBEVENT_BINARY_DIR)
+    find_library(DOUBLE_LIBEVENT_CORE_SHARED
+        NAMES libevent_core.so
         PATHS ${DOUBLE_LIBEVENT_BINARY_DIR}
-        NO_DEFAULT_PATH
-    )
-    if (${libevent_shared} STREQUAL libevent_shared-NOTFOUND)
-        message(FATAL_ERROR "libevent.so could not be found '${DOUBLE_LIBEVENT_BINARY_DIR}'")
+        NO_DEFAULT_PATH)
+    if (${DOUBLE_LIBEVENT_CORE_SHARED} STREQUAL DOUBLE_LIBEVENT_CORE-NOTFOUND)
+        message(FATAL_ERROR "libevent_core.so could not be found on '${DOUBLE_LIBEVENT_BINARY_DIR}'")
     endif()
+    add_library(event_core SHARED IMPORTED)
+    set_target_properties(event_core PROPERTIES
+        IMPORTED_LOCATION   ${DOUBLE_LIBEVENT_CORE_SHARED})
 
-    # libevent openssl
-    find_library(libevent_openssl_shared
+    find_library(DOUBLE_LIBEVENT_OPENSSL_SHARED
         NAMES libevent_openssl.so
         PATHS ${DOUBLE_LIBEVENT_BINARY_DIR}
-        NO_DEFAULT_PATH
-    )
-    if (${libevent_openssl_shared} STREQUAL libevent_openssl_shared-NOTFOUND)
-        message(FATAL_ERROR "libevent_openssl.so could not be found '${DOUBLE_LIBEVENT_BINARY_DIR}'")
+        NO_DEFAULT_PATH)
+    if (${DOUBLE_LIBEVENT_OPENSSL_SHARED} STREQUAL DOUBLE_LIBEVENT_OPENSSL_SHARED-NOTFOUND)
+        message(FATAL_ERROR "libevent_openssl.so could not be found on '${DOUBLE_LIBEVENT_BINARY_DIR}'")
     endif()
-
-    # header files
+    add_library(event_openssl SHARED IMPORTED)
+    set_target_properties(event_openssl PROPERTIES
+        IMPORTED_LOCATION   ${DOUBLE_LIBEVENT_OPENSSL_SHARED})
+    
+    # Check the directory 'event2' is exists in the directory
     find_path(libevent_include_dir
         NAMES event2
         PATHS ${DOUBLE_LIBEVENT_INCLUDE_DIR}
-        NO_DEFAULT_PATH
-    )
-    if (${libevent_include_dir} STREQUAL libevent_include_dir-NOTFOUND)
-        message(FATAL_ERROR "libevent header files could not be found '${DOUBLE_LIBEVENT_INCLUDE_DIR}'")
+        NO_DEFAULT_PATH)
+    if (libevent_include_dir STREQUAL libevent_include_dir-NOTFOUND)
+        message(FATAL_ERROR "libevent include directory 'event2' could not be found on '${DOUBLE_LIBEVENT_INCLUDE_DIR}'")
     endif()
-
-    set(LIBEVENT_INCLUDE_DIRS ${libevent_include_dir})
-    set(LIBEVENT_SHARED_LIBRARIES ${libevent_shared} ${libevent_openssl_shared})
-
+    target_link_libraries(event
+        INTERFACE event_core event_openssl)
+    target_include_directories(event
+        INTERFACE ${DOUBLE_LIBEVENT_INCLUDE_DIR})
 else()
-    find_package(Libevent QUIET)
-    message(STATUS "OOOKK")
+    find_package(Libevent)
     if (NOT Libevent_FOUND)
-        message(FATAL_ERROR "Find package 'libevent' failed. If you already installed 'libevent', use 'DOUBLE_LIBEVENT_BINARY_DIR' and 'DOUBLE_LIBEVENT_INCLUDE_DIR' to specify the directory") 
+        message(FATAL_ERROR "libevent not found. If you already installed libevent, use 'DOUBLE_LIBEVENT_BINARY_DIR' and 'DOUBLE_LIBEVENT_INCLUDE_DIR' to set the directory") 
     endif()
     target_include_directories(event
         INTERFACE ${LIBEVENT_INCLUDE_DIRS})
     target_link_libraries(event
-        INTERFACE libevent.so
-    event_shared event_openssl_shared)
-
-    message(STATUS "Libevent include: ${LIBEVENT_INCLUDE_DIRS}")
-    message(STATUS "Libevent lib: ${event_openssl_shared}")
+        INTERFACE event_core_shared event_openssl_shared)
 endif()
-
-
-# LIBSSL
-find_package(OpenSSL REQUIRED)
-add_library(ssl SHARED IMPORTED)
-
-set_target_properties(ssl PROPERTIES
-    IMPORTED_LOCATION "${OPENSSL_LIBRARIES}"
-    BUILD_INTERFACE "${OPENSSL_INCLUDE_DIR}"
-    #INTERFACE_LINK_LIBRARIES "-lpthread;event_core_shared"
-)
-
-#add_library(ssl INTERFACE)
-#target_include_directories(ssl SYSTEM INTERFACE
-#    $<BUILD_INTERFACE:${OPENSSL_INCLUDE_DIR}>
-#    )
-##target_include_directories(ssl
-##    INTERFACE ${OPENSSL_INCLUDE_DIR})
-#target_link_libraries(ssl
-#    INTERFACE ${OPENSSL_LIBRARIES})
-message(STATUS "OpenSSL include: ${OPENSSL_INCLUDE_DIR}")
-message(STATUS "OpenSSL lib: ${OPENSSL_LIBRARIES}")

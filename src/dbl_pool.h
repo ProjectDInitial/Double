@@ -63,5 +63,9 @@ void dbl_pool_reset(struct dbl_pool *pool);
  */
 void *dbl_pool_alloc(struct dbl_pool *pool, size_t size);
 
-void *dbl_pool_calloc(struct dbl_pool *pool, size_t n, size_t size); 
+void *dbl_pool_calloc(struct dbl_pool *pool, size_t n, size_t size);
+
+char *dbl_pool_strdup(struct dbl_pool *pool, const char *str);
+
+char *dbl_pool_strndup(struct dbl_pool *pool, const char *str, size_t len); 
 #endif

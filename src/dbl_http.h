@@ -1,6 +1,7 @@
 #ifndef __DBL_HTTP_H
 #define __DBL_HTTP_H
 
+#include <http_parser.h>
 #include "dbl_config.h"
 
 struct dbl_http_uri {
@@ -23,6 +24,8 @@ struct dbl_http_form {
     struct dbl_http_pair          **tail;
     int                             count;
 };
+
+typedef int (*dbl_http_pair_comparator)(const struct dbl_http_pair *, const struct dbl_http_pair *);
 
 #define dbl_http_form_foreach(pair, form) for(pair = (form)->header; pair; pair = (pair)->next)
 
@@ -221,7 +224,7 @@ int dbl_http_form_add(struct dbl_http_form *form, const char *key, const char *v
  * @param key the key string
  * @param val the value string
  *
- * @return 
+ * @return 0 on success or -1 on failure
  */
 int dbl_http_form_add_reference(struct dbl_http_form *form, const char *key, const char *val);
 
@@ -256,6 +259,24 @@ const char *dbl_http_form_find(const struct dbl_http_form *form, const char *key
  */
 void dbl_http_form_remove(struct dbl_http_form *form, const char *key); 
 
+
+/**
+ * @brief Sort a http form
+ */
+void dbl_http_form_sort(struct dbl_http_form *form, dbl_http_pair_comparator comparator); 
+
+/**
+ * @brief Parse the uri form data 
+ *
+ * @param form a form to hold the parsed result
+ * @param formdata the uri-formdata to be parsed
+ * @param len how many bytes can be parsed
+ *
+ * @return 0 on success or -1 on failure
+ */
+int dbl_http_form_parse_formdata(struct dbl_http_form *form, const char *formdata, size_t len, int decode); 
+
+
 /**
  * @brief URI-encode data to buffer 
  *
@@ -281,17 +302,6 @@ size_t dbl_http_encode_uri(const char *data, size_t length, char *buf, size_t *n
  * @return the number of bytes decoded from the data
  */
 size_t dbl_http_decode_uri(const char *data, size_t length, char *buf, size_t *n); 
-
-/**
- * @brief Parse the uri form data 
- *
- * @param form a form to hold the parsed result
- * @param formdata the uri-formdata to be parsed
- * @param len how many bytes can be parsed
- *
- * @return 0 on success or -1 on failure
- */
-int dbl_http_form_parse_formdata(struct dbl_http_form *form, const char *formdata, size_t len, int decode); 
 
 /**
  * @brief Initialize a http uri parser 

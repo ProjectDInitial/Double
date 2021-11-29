@@ -3,8 +3,14 @@
 
 #include "dbl_eventloop.h"
 
-int dbl_init_signal(struct dbl_eventloop *evloop); 
+/**
+ * @brief Process starts processing event loop 
+ */
+void dbl_process_runeventloop(struct dbl_eventloop *evloop); 
 
-void dbl_process_eventloop(struct dbl_eventloop *evloop); 
+/**
+ * @brief Send a signal to Read PID from file and send a signal to process
+ */
+void dbl_process_sendsignal(const char *signal, struct dbl_log *log); 
 
 #endif

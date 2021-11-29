@@ -1,94 +1,105 @@
-#include <dbl_config.h>
+#include "dbl_config.h"
 #include "dbl_process.h"
-#include "dbl_process_request.h"
 #include "dbl_pool.h"
+#include "dbl_util.h"
 
 struct dbl_signal {
-    int                 signo;      /* System signal number */
-    char               *signame;    /* System signal name */
-    char               *name;       /* Double service signal name */
-    event_callback_fn   handler;  
+    char               *name;       /* Signal name of Double */
+    char               *signame;    /* Signal name of system */
+    int                 signo;      /* Signal number of system */
 };
 
-static void dbl_signal_handler_(int signo, short events, void *data);
-
-struct dbl_signal signals[] = {
+const struct dbl_signal dbl_signal_map[] = {
     {
-        SIGTERM,
-        "SIGTERM",
         "stop",
-        dbl_signal_handler_,
+        "SIGTERM",
+        SIGTERM,
     },
     {
-        SIGPIPE,
-        "SIGPIPE",
         NULL,
         NULL,
-    },
-    {
-        0,
-        NULL,
-        NULL,
-        NULL,
-    },
+        0
+    }    
 };
 
-static void dbl_signal_handler_(int signo, short events, void *data) {
-    struct dbl_eventloop *evloop;
+static int dbl_write_pid_(const char *filepath) {
+    FILE *fpid;
+    int n;
 
-    evloop = data;
-    switch (signo) {
-        case SIGTERM:
-            event_base_loopbreak(evloop->evbase);
-            break;
-        default:
-            dbl_log_error(DBL_LOG_ERROR, evloop->log, 0, "Unused signal '%d'", signo);
-            break;
-    }
+    fpid = fopen(filepath, "w");
+    if (fpid == NULL) 
+        return -1;
+
+    n = fprintf(fpid, "%d", getpid()); 
+    fclose(fpid);
+    return n > 0? 0: -1;
 }
 
-int dbl_init_signals(struct dbl_eventloop *evloop) {
-    const struct dbl_signal *sig;
-    struct event *ev;
+static int dbl_read_pid_(const char *filepath) {
+    FILE *fpid;
+    char buf[DBL_INT_LEN];
+    int pid;
+    size_t n;
+    
+    pid = -1;
+    fpid = fopen(filepath, "r");
+    if (fpid == NULL)
+        goto done;
 
-    for (sig = signals; sig->signo > 0; sig++) {
-        if (sig->handler == NULL) {
-            if (signal(sig->signo, SIG_IGN) == SIG_ERR) {
-                dbl_log_error(DBL_LOG_ERROR, evloop->log, errno, "signal(%s, SIG_IGN) failed", sig->signame);
-                return -1;
-            }
-            continue;
-        }
+    n = fread(buf, sizeof(char), DBL_INT_LEN, fpid);
+    if (n == 0)
+        goto done;
 
-        ev = dbl_pool_alloc(evloop->pool, event_get_struct_event_size());
-        if (ev == NULL)
-            return -1;
+    pid = dbl_atoi(buf, n);
 
-        if (event_assign(ev, evloop->evbase, sig->signo, EV_SIGNAL|EV_PERSIST, NULL, NULL) == -1) {
-            dbl_log_error(DBL_LOG_ERROR, evloop->log, errno, "%s:event_assign() failed", __func__);
-            return -1;
-        }
-        if (event_add(ev, NULL) == -1) {
-            dbl_log_error(DBL_LOG_ERROR, evloop->log, errno, "%s:event_add() failed", __func__);
-            return -1;
-        }
-    }
-    return 0;
+done:
+    if (fpid)
+        fclose(fpid);
+    return pid;
 }
 
-void dbl_process_eventloop(struct dbl_eventloop *evloop) {
-    /* Use new log */
-    evloop->log = &evloop->newlog;
-    evloop->pool->log = evloop->log;
-    dbl_httpserver_set_log(evloop->http, evloop->log);
-    dbl_mq_exchanger_set_log(evloop->exchanger, evloop->log);
-
-    fclose(evloop->pidfile);
-
-    /* Set http request processers */
-    dbl_httpserver_set_cbs(evloop->http, NULL, dbl_request_handler, NULL, evloop);
+void dbl_process_runeventloop(struct dbl_eventloop *evloop) {
+    /* Write pid to file */
+    if (dbl_write_pid_(DOUBLE_PID_PATH)  == -1) {
+        dbl_log_error(DBL_LOG_ERROR, evloop->log, errno, "write pid to file '%s' failed", DOUBLE_PID_PATH);
+        return;
+    }
 
     event_base_dispatch(evloop->evbase);
 
+    if (remove(DOUBLE_PID_PATH) != 0)
+        dbl_log_error(DBL_LOG_ERROR, evloop->log, errno, "remove pid file '%s' failed", DOUBLE_PID_PATH);
+
     dbl_release_eventloop(evloop);
+}
+
+void dbl_process_sendsignal(const char *signal, struct dbl_log *log) {
+    const struct dbl_signal *sig;
+    int signo;
+    int pid;
+    int res;
+    
+    signo = 0;
+    for (sig = dbl_signal_map; sig->signo > 0; sig++) {
+        if (dbl_strcasecmp(sig->name, signal) == 0) {
+            signo = sig->signo;
+            break;
+        }
+    }
+
+    if (signo == 0) { 
+        dbl_log_error(DBL_LOG_ERROR, log, 0, "unknow signal '%s'", signal);
+        return;
+    }
+
+    pid = dbl_read_pid_(DOUBLE_PID_PATH);
+    if (pid == -1) {
+        dbl_log_error(DBL_LOG_ERROR, log, errno, "read pid from file '%s' failed", DOUBLE_PID_PATH);
+        return;
+    }
+
+    res = kill(pid, sig->signo);
+    if (res != 0) {
+        dbl_log_error(DBL_LOG_ERROR, log, errno, "kill(%d, %s) failed", pid, sig->signame);
+    }
 }

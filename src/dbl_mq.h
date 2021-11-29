@@ -43,17 +43,13 @@ struct dbl_mq_message {
  * return 'DBL_MQ_ACPTQUEUE_BIND_RESOURCE_LOCKED' */
 #define DBL_MQ_ACPTQUEUE_FLAG_EXCLUSIVE        (1 << 0)
 
-/* Kick out other accept queues with the same router key on the exchanger */
-#define DBL_MQ_ACPTQUEUE_FLAG_KICKOUT_QUEUES   (1 << 1)
-
 /* Accept queue events */
-#define DBL_MQ_ACPTQUEUE_EVENT_READ    (1 << 0)        
-#define DBL_MQ_ACPTQUEUE_EVENT_CLOSED  (1 << 1)
-#define DBL_MQ_ACPTQUEUE_EVENT_KICKED  (1 << 2) 
+#define DBL_MQ_ACPTQUEUE_EVENT_READ     (1 << 0)        
+#define DBL_MQ_ACPTQUEUE_EVENT_CLOSED   (1 << 1)
+#define DBL_MQ_ACPTQUEUE_EVENT_EXCLUDED (1 << 2) 
 
 enum dbl_mq_acceptqueue_bind_error {
     DBL_MQ_ACPTQUEUE_BIND_NO_ERROR,
-    DBL_MQ_ACPTQUEUE_BIND_CONFLICT,
     DBL_MQ_ACPTQUEUE_BIND_RESOURCE_LOCKED,
     DBL_MQ_ACPTQUEUE_BIND_MEMORY_ERROR,
 };
@@ -69,7 +65,7 @@ struct dbl_mq_exchanger *dbl_mq_exchanger_new(struct event_base *evbase, struct 
 /**
  * @brief Free a exchanger
  */
-void dbl_mq_exchanger_free();
+void dbl_mq_exchanger_free(struct dbl_mq_exchanger *exchanger);
 
 
 /**
@@ -91,24 +87,31 @@ void dbl_mq_exchanger_set_log(struct dbl_mq_exchanger *exchanger, struct dbl_log
 int dbl_mq_exchanger_forward(struct dbl_mq_exchanger *exchanger, const struct dbl_mq_routekey *dst, const void *data, size_t size, int priority); 
 
 /**
- * @brief Create a queue for accept the messages on an exchanger
+ * @brief Create a queue from pool for accept messages on exchanger
  *
+ * @param pool a pool
  * @param exchanger an exchanger object
  * @param flags see 'DBL_MQ_ACPTQUEUE_FLAG_*'
  *
  * @return a pointer to accept queue or NULL on error
  */
-struct dbl_mq_acceptqueue *dbl_mq_acceptqueue_new(struct dbl_mq_exchanger *exchanger, int flags);
-
-void dbl_mq_acceptqueue_free(struct dbl_mq_acceptqueue *queue);
+struct dbl_mq_acceptqueue *dbl_mq_create_acceptqueue(struct dbl_pool *pool, struct dbl_mq_exchanger *exchanger, int flags); 
 
 /**
- * @brief Set callbacks for accept queue 
+ * @brief Delete the all resources on queue 
  */
-void dbl_mq_acceptqueue_set_cb(struct dbl_mq_acceptqueue *queue, dbl_mq_acceptqueue_event_cb event_cb, void *cbarg);
+void dbl_mq_delete_acceptqueue(struct dbl_mq_acceptqueue *queue);
+
+int dbl_mq_acceptqueue_count(const struct dbl_mq_acceptqueue *queue);
 
 /**
- * @brief Accept queue bind to specific route key on the exchanger
+ * @brief Set event callback for accept queue 
+ */
+void dbl_mq_acceptqueue_set_event_cb(struct dbl_mq_acceptqueue *queue, dbl_mq_acceptqueue_event_cb event_cb, void *cbarg);
+
+/**
+ * @brief Bind queue to exchanger for accept messages from the 
+ *        specific route key 
  *
  * @param queue a queue to be bound
  * @param src source route key 
@@ -118,21 +121,21 @@ void dbl_mq_acceptqueue_set_cb(struct dbl_mq_acceptqueue *queue, dbl_mq_acceptqu
 enum dbl_mq_acceptqueue_bind_error dbl_mq_acceptqueue_bind(struct dbl_mq_acceptqueue *queue, const struct dbl_mq_routekey *src);
 
 /**
- * @brief Accept queue unbind 
+ * @brief Unbind the queue
  */
 void dbl_mq_acceptqueue_unbind(struct dbl_mq_acceptqueue *queue); 
 
 /**
- * @brief Re-enable an accept queue that has been disabled
+ * @brief Re-enable the event of queue 
  *
  * @return 0 on success or -1 on failure 
  */
-int dbl_mq_acceptqueue_enable(struct dbl_mq_acceptqueue *queue);
+int dbl_mq_acceptqueue_enable_event(struct dbl_mq_acceptqueue *queue);
 
 /**
- * @brief Stop listening for messages on an accept queue
+ * @brief Disable the event of queue 
  */
-void dbl_mq_acceptqueue_disable(struct dbl_mq_acceptqueue *queue);
+void dbl_mq_acceptqueue_disable_event(struct dbl_mq_acceptqueue *queue);
 
 /**
  * @brief Dequeue message from accept queue  

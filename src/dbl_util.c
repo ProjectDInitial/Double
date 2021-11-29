@@ -52,20 +52,14 @@ int dbl_strcasecmp(const char *s1, const char *s2) {
 }
 #endif
 
-char *dbl_pstrdup(struct dbl_pool *pool, const char *str) {
-    return dbl_pstrndup(pool, str, strlen(str));
-}
-
-char *dbl_pstrndup(struct dbl_pool *pool, const char *str, size_t len) {
-    char *dst;
-
-    dst = dbl_pool_alloc(pool, len + 1);
-    if (dst == NULL)
-        return NULL;
-
-    memcpy(dst, str, len);
-    dst[len] = '\0';
-    return dst;
+char *dbl_strftimenow(char *buf, size_t size, const char *fmt) {
+    time_t s;
+    struct tm *t;
+        
+    s = time(NULL);
+    t = localtime(&s);
+    strftime(buf, size, fmt, t);
+    return buf;
 }
 
 int dbl_mstotv(int ms, struct timeval *tv) {
@@ -73,28 +67,89 @@ int dbl_mstotv(int ms, struct timeval *tv) {
         return -1;
 
     tv->tv_sec = ms / 1000;
-    tv->tv_usec = (ms% 1000) * 1000;
+    tv->tv_usec = (ms % 1000) * 1000;
     return 0;
 }
 
-int dbl_atoi(const char *str, size_t n) {
-    /* Copy from nginx */
-    int value, cutoff, cutlim;
+#define XX(type, max, name)                                                 \
+type dbl_ato##name(const char *str, size_t len) {                           \
+    type value, cutoff;                                                     \
+    int cutlim;                                                             \
+    if (len == 0)                                                           \
+        return -1;                                                          \
+    cutoff = max / 10;                                                      \
+    cutlim = max % 10;                                                      \
+    for (value = 0; len--; str++) {                                         \
+        if (*str < '0' || *str> '9')                                        \
+            return -1;                                                      \
+                                                                            \
+        if (value >= cutoff && (value > cutoff || *str - '0' > cutlim))     \
+            return -1;                                                      \
+                                                                            \
+        value = value * 10 + (*str - '0');                                  \
+    }                                                                       \
+    return value;                                                           \
+}
+    DBL_ATOI_MAP(XX)
+#undef XX
 
-    if (n == 0)
+time_t dbl_atott(const char *str, size_t len) {
+#if DOUBLE_SIZEOF_TIME_T == 4
+    return dbl_atoi32(str, len);
+#elif DOUBLE_SIZEOF_TIME_T == 8
+    return dbl_atoi64(str, len);
+#else
+#error "Could not to define function 'dbl_atott'"
+#endif
+}
+
+int dbl_make_socketaddr(const char *host, uint16_t port, struct sockaddr *out, int *outlen) {
+    struct sockaddr_in *ipv4; 
+    struct sockaddr_in6 *ipv6;
+
+    ipv4 = (struct sockaddr_in *)out;
+    if (evutil_inet_pton(AF_INET, host, &ipv4->sin_addr) == 0) {
+        ipv4->sin_family = AF_INET;
+        ipv4->sin_port = htons(port);
+        *outlen = sizeof(struct sockaddr_in);
+        return 0;
+    }
+
+    ipv6 = (struct sockaddr_in6 *)out;
+    if (evutil_inet_pton(AF_INET6, host, &ipv6->sin6_addr) == 0) {
+        ipv6->sin6_family = AF_INET;
+        ipv6->sin6_port = htons(port);
+        *outlen = sizeof(struct sockaddr_in6);
+        return 0;
+    }
+
+    return -1;
+}
+
+int dbl_parse_socketaddr(const struct sockaddr *addr, char *hostbuf, size_t n, uint16_t *outport) {
+    const struct sockaddr_in *ipv4; 
+    const struct sockaddr_in6 *ipv6;
+    const void *host;
+    uint16_t port;
+
+    switch (addr->sa_family) {
+        case AF_INET:
+            ipv4 = (struct sockaddr_in*)addr;
+            host = &ipv4->sin_addr;
+            port = ipv4->sin_port;
+            break;
+        case AF_INET6:
+            ipv6 = (struct sockaddr_in6*)addr;
+            host = &ipv6->sin6_addr;
+            port = ipv6->sin6_port;
+            break;
+        default:
+            return -1;
+    }
+    
+    if (evutil_inet_ntop(addr->sa_family, host, hostbuf, n) == NULL)
         return -1;
 
-    cutoff = INT_MAX / 10;
-    cutlim = INT_MAX % 10;
-
-    for (value = 0; n--; str++) {
-        if (*str < '0' || *str> '9')
-            return -1;
-
-        if (value >= cutoff && (value > cutoff || *str - '0' > cutlim))
-            return -1;
-
-        value = value * 10 + (*str - '0');
-    }
-    return value;
+    *outport = ntohs(port);
+    return 0;
 }

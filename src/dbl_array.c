@@ -2,11 +2,16 @@
 #include "dbl_pool.h"
 
 int dbl_array_init(struct dbl_array *array, struct dbl_pool *pool, unsigned int capacity, size_t element_size) {
-    void *elements;
+    void *elements; 
 
-    elements = dbl_pool_alloc(pool, capacity * element_size);
-    if (elements == NULL)
-        return -1;
+    assert(element_size > 0);
+
+    elements = NULL;
+    if (capacity > 0) {
+        elements = dbl_pool_alloc(pool, capacity * element_size);
+        if (elements == NULL)
+            return -1;
+    }
 
     array->elements = elements;
     array->pool = pool;
@@ -17,23 +22,22 @@ int dbl_array_init(struct dbl_array *array, struct dbl_pool *pool, unsigned int 
 }
 
 void *dbl_array_push(struct dbl_array *array) {
-    void *ele;
-    void *newelements;
-    unsigned newcapacity;
+    void *elements;
+    unsigned capacity;
+    unsigned index;
 
     if (array->length == array->capacity) {
-        newcapacity = array->capacity * 2; 
-        newelements = dbl_pool_alloc(array->pool, newcapacity);
-        if (newelements == NULL)
+        capacity = array->capacity * 2; 
+        elements = dbl_pool_alloc(array->pool, capacity * array->element_size);
+        if (elements == NULL)
             return NULL;
 
-        memcpy(newelements, array->elements, array->capacity * array->element_size);
-        
-        array->capacity = newcapacity;
-        array->elements = newelements;
+        memcpy(elements, array->elements, array->capacity * array->element_size);
+        array->capacity = capacity;
+        array->elements = elements;
     }
 
-    ele = (char *)array->elements + array->length * array->element_size;
+    index = array->length;
     array->length++;
-    return ele;
+    return (char *)array->elements + (index * array->element_size);
 }

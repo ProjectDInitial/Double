@@ -2,8 +2,6 @@
 #include "dbl_pool.h"
 #include "dbl_util.h"
 
-#include  <http_parser.h>
-
 void dbl_http_form_init(struct dbl_http_form *form, struct dbl_pool *pool) {
     form->header = NULL;
     form->tail = &form->header;
@@ -17,11 +15,11 @@ int dbl_http_form_add(struct dbl_http_form *form, const char *key, const char *v
     assert(key != NULL);
     assert(val != NULL);
     
-    k = dbl_pstrdup(form->pool, key);
+    k = dbl_pool_strdup(form->pool, key);
     if (k == NULL)
         return -1;
 
-    v = dbl_pstrdup(form->pool, val);
+    v = dbl_pool_strdup(form->pool, val);
     if (v == NULL)
         return -1;
     
@@ -66,7 +64,7 @@ int dbl_http_form_insert(struct dbl_http_form *form, const char *key, const char
     if (pair == NULL)
         return dbl_http_form_add(form, key, val);
 
-    v = dbl_pstrdup(form->pool, val);
+    v = dbl_pool_strdup(form->pool, val);
     if (v == NULL)
         return -1;
 
@@ -103,6 +101,55 @@ void dbl_http_form_remove(struct dbl_http_form *form, const char *key) {
     }
 }
 
+static void dbl_http_form_sort_one_(struct dbl_http_form *form, struct dbl_http_pair **startat, dbl_http_pair_comparator comparator) {
+    struct dbl_http_pair **prev, *curr, *next, *top, **top_prev;
+    
+    top = *startat;
+    top_prev = NULL;
+    for (prev = &top->next, curr = top->next; 
+         curr != NULL; 
+         prev = &curr->next, curr = curr->next) 
+    {
+        if (comparator(top, curr)) {
+            top = curr;
+            top_prev = prev;
+        }
+    }
+
+    if (top_prev == NULL)
+        return;
+
+    curr = *startat;
+    if (curr->next == top) {
+        curr->next = top->next;
+        top->next = curr;
+    } 
+    else {
+        next = curr->next;
+        curr->next = top->next;
+        top->next = next;
+        *top_prev = curr;
+    }
+    
+    if (curr->next == NULL)
+        form->tail = &curr->next;
+    
+    *startat = top;
+}
+
+void dbl_http_form_sort(struct dbl_http_form *form, dbl_http_pair_comparator comparator) {
+    struct dbl_http_pair **header;
+
+    if (form->header == NULL)
+        return;
+
+    header = &form->header;
+    while (*header) {
+        dbl_http_form_sort_one_(form, header, comparator);
+        header = &(*header)->next;
+    }
+}
+
 int dbl_http_form_parse_formdata(struct dbl_http_form *form, const char *formdata, size_t len, int decode) { 
     char *s;
     char *chunk, *key, *val;
@@ -110,7 +157,7 @@ int dbl_http_form_parse_formdata(struct dbl_http_form *form, const char *formdat
     if (len == 0)
         return 0;
 
-    s = dbl_pstrndup(form->pool, formdata, len);
+    s = dbl_pool_strndup(form->pool, formdata, len);
     if (s == NULL)
         return -1;
 
@@ -234,7 +281,7 @@ int dbl_http_uri_parse(struct dbl_http_uri *uri, const char *url, size_t len) {
     if (len == 0)
         return -1;
 
-    u = dbl_pstrndup(uri->pool, url, len);
+    u = dbl_pool_strndup(uri->pool, url, len);
     if (u == NULL)
         return -1;
     
@@ -265,7 +312,7 @@ const char *dbl_http_method_str(enum dbl_http_method method) {
 #define XX(num, name, string) case DHTTP_METHOD_##name: return #string;
   DHTTP_METHOD_MAP(XX)
 #undef XX
-        default: return "<unkown>";
+        default: return "unkown";
     }
 }
 
@@ -274,7 +321,7 @@ const char *dbl_http_status_str(enum dbl_http_status status) {
 #define XX(num, name, string) case DHTTP_STATUS_##name: return #string;
     DHTTP_STATUS_MAP(XX)
 #undef XX
-    default: return "<unknown>";
+    default: return "unknown";
     }
 }
 
