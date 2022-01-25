@@ -42,18 +42,20 @@ struct dbl_mq_message {
  * If other queues bind to the same route key, that will be 
  * return 'DBL_MQ_ACPTQUEUE_BIND_RESOURCE_LOCKED' */
 #define DBL_MQ_ACPTQUEUE_FLAG_EXCLUSIVE        (1 << 0)
+#define DBL_MQ_ACPTQUEUE_FLAG_DEFER_CALLBACK   (1 << 1)
 
 /* Accept queue events */
 #define DBL_MQ_ACPTQUEUE_EVENT_READ     (1 << 0)        
 #define DBL_MQ_ACPTQUEUE_EVENT_CLOSED   (1 << 1)
 #define DBL_MQ_ACPTQUEUE_EVENT_EXCLUDED (1 << 2) 
 
-enum dbl_mq_acceptqueue_bind_error {
-    DBL_MQ_ACPTQUEUE_BIND_NO_ERROR,
-    DBL_MQ_ACPTQUEUE_BIND_RESOURCE_LOCKED,
-    DBL_MQ_ACPTQUEUE_BIND_MEMORY_ERROR,
+enum dbl_mq_bind_error {
+    DBL_MQ_BIND_OK,
+    DBL_MQ_BIND_RESOURCE_LOCKED,
+    DBL_MQ_BIND_MEMORY_ERROR,
 };
 
+typedef void (*dbl_mq_acceptqueue_data_cb)(struct dbl_mq_acceptqueue *queue, void *data);
 typedef void (*dbl_mq_acceptqueue_event_cb)(struct dbl_mq_acceptqueue *queue, short events, void *data);
 
 /**
@@ -87,58 +89,48 @@ void dbl_mq_exchanger_set_log(struct dbl_mq_exchanger *exchanger, struct dbl_log
 int dbl_mq_exchanger_forward(struct dbl_mq_exchanger *exchanger, const struct dbl_mq_routekey *dst, const void *data, size_t size, int priority); 
 
 /**
- * @brief Create a queue from pool for accept messages on exchanger
+ * @brief Create a new initialized accept queue from pool
  *
- * @param pool a pool
- * @param exchanger an exchanger object
- * @param flags see 'DBL_MQ_ACPTQUEUE_FLAG_*'
+ * @param exchanger the exchanger on which accept message from
+ * @param routekey the specific routei key on exchanger 
+ * @param flags a set of flag, see 'DBL_MQ_ACPTQUEUE_FLAG_*'
  *
  * @return a pointer to accept queue or NULL on error
  */
-struct dbl_mq_acceptqueue *dbl_mq_create_acceptqueue(struct dbl_pool *pool, struct dbl_mq_exchanger *exchanger, int flags); 
+struct dbl_mq_acceptqueue *dbl_mq_acceptqueue_create(struct dbl_pool *pool, struct dbl_mq_exchanger *exchanger, const struct dbl_mq_routekey *routekey, int flags); 
 
 /**
- * @brief Delete the all resources on queue 
+ * @brief Destory an accept queue 
  */
-void dbl_mq_delete_acceptqueue(struct dbl_mq_acceptqueue *queue);
+void dbl_mq_acceptqueue_destory(struct dbl_mq_acceptqueue *queue);
 
+/**
+ * @brief Set callbacks for accept queue 
+ */
+void dbl_mq_acceptqueue_set_cbs(struct dbl_mq_acceptqueue *queue, dbl_mq_acceptqueue_data_cb data_cb, dbl_mq_acceptqueue_event_cb event_cb, void *cbarg); 
+
+/**
+ * @brief Start to accept messages from exchanger 
+ */
+enum dbl_mq_bind_error dbl_mq_acceptqueue_enable(struct dbl_mq_acceptqueue *queue);
+
+/**
+ * @brief Stop to accept messages from exchanger 
+ */
+void dbl_mq_acceptqueue_disable(struct dbl_mq_acceptqueue *queue); 
+
+/**
+ * @brief Count the number of messages
+ */
 int dbl_mq_acceptqueue_count(const struct dbl_mq_acceptqueue *queue);
 
 /**
- * @brief Set event callback for accept queue 
+ * @brief Get the messages total size of the queue 
  */
-void dbl_mq_acceptqueue_set_event_cb(struct dbl_mq_acceptqueue *queue, dbl_mq_acceptqueue_event_cb event_cb, void *cbarg);
+size_t dbl_mq_acceptqueue_size(const struct dbl_mq_acceptqueue *queue);
 
 /**
- * @brief Bind queue to exchanger for accept messages from the 
- *        specific route key 
- *
- * @param queue a queue to be bound
- * @param src source route key 
- *
- * @return see enum 'dbl_mq_acceptqueue_bind_error'
- */
-enum dbl_mq_acceptqueue_bind_error dbl_mq_acceptqueue_bind(struct dbl_mq_acceptqueue *queue, const struct dbl_mq_routekey *src);
-
-/**
- * @brief Unbind the queue
- */
-void dbl_mq_acceptqueue_unbind(struct dbl_mq_acceptqueue *queue); 
-
-/**
- * @brief Re-enable the event of queue 
- *
- * @return 0 on success or -1 on failure 
- */
-int dbl_mq_acceptqueue_enable_event(struct dbl_mq_acceptqueue *queue);
-
-/**
- * @brief Disable the event of queue 
- */
-void dbl_mq_acceptqueue_disable_event(struct dbl_mq_acceptqueue *queue);
-
-/**
- * @brief Dequeue message from accept queue  
+ * @brief Dequeue a message from accept queue  
  *
  * @param queue
  *

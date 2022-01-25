@@ -1,7 +1,7 @@
 # Double
-'Double' is a remote event service based on HTTP protocol. HTTP server call this service can push events to client easily, and HTTP client(especially 'web-browser') also can be received events from server easily. 
+Double is an remote event service based on HTTP protocol, used for http server push event easily.
 
-NOTES: This service only supports unix/linux
+**NOTES: Double just support POSIX systems like linux**
 
 ## 1. BUILDING AND INSTALLATION
 
@@ -31,5 +31,4 @@ The following 'Double' specific CMake variables are as follows
   
   # Specify the libevent include directory
   DOUBLE_LIBEVENT_INCLUDE_DIR
-```
-
+``` 

@@ -1475,7 +1475,7 @@ int dbl_httpserver_request_set_output_timeout(struct dbl_httpserver_request *req
     else
         evutil_timerclear(&req->output_timeout);
 
-    if (conn->state != DHTTPSVR_CONN_READING)
+    if (conn->state != DHTTPSVR_CONN_WRITING)
         return 0;
 
     return evutil_timerisset(&req->output_timeout) ?

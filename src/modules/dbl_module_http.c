@@ -40,20 +40,32 @@ struct dbl_module_http_config {
 };
 
 struct dbl_module_http_ctx {
-    struct dbl_module_http_config   config;
-    struct dbl_httpserver          *server;
-    struct dbl_mq_exchanger        *exchanger;
-    struct dbl_log                 *log;
-    struct dbl_log                 *accesslog;
+    struct dbl_module_http_config                       config;
+    struct dbl_httpserver                              *server;
+    struct dbl_mq_exchanger                            *exchanger;
+    struct dbl_log                                     *log;
+    struct dbl_log                                     *accesslog;
+    TAILQ_HEAD(, dbl_module_http_outputeventstream)     eventlisteners;
 };
 
-typedef int (*dbl_module_http_request_handler)(struct dbl_module_http_ctx *, struct dbl_httpserver_request *);
+#define DBL_MODULE_HTTP_OUTEVENTSTREAM_HIGHWM           4096
+
+struct dbl_module_http_outputeventstream {
+    struct evbuffer                                    *buffer;
+    size_t                                              buffer_watermark;
+    struct dbl_httpserver_request                      *request;
+    struct dbl_mq_acceptqueue                          *eventsource;
+    struct dbl_module_http_ctx                         *modulectx;
+    TAILQ_ENTRY(dbl_module_http_outputeventstream)      next;
+};
+
+typedef int (*dbl_module_http_request_action_handler)(struct dbl_module_http_ctx *, struct dbl_httpserver_request *);
 
 struct dbl_module_http_route {
     const char                     *path;
     enum dbl_http_method            method;
     const char                     *content_type;
-    int                           (*request_handler)(struct dbl_module_http_ctx *, struct dbl_httpserver_request *);
+    int                           (*request_action_handler)(struct dbl_module_http_ctx *, struct dbl_httpserver_request *);
 };
 
 const struct dbl_yamlmapper_command dbl_module_http_map_config_field_commands[] = {
@@ -381,6 +393,7 @@ static int dbl_module_http_init_(struct dbl_eventloop *evloop, struct dbl_yamlma
     mctx->server = httpsvr;
     mctx->log = evloop->log;
     mctx->exchanger = exchanger;
+    TAILQ_INIT(&mctx->eventlisteners);
     dbl_eventloop_set_module_ctx(evloop, dbl_module_http, mctx);
 
     return 0;
@@ -492,6 +505,309 @@ static void dbl_module_http_delete_config_(struct dbl_module_http_ctx *mctx) {
         SSL_CTX_free(mctx->config.ssl.sslctx);
 }
 
+static struct dbl_module_http_outputeventstream *dbl_module_http_create_outputeventstream_(struct dbl_module_http_ctx *mctx, struct dbl_httpserver_request *req, const struct dbl_mq_routekey *routekey, int flags) { 
+    struct dbl_module_http_outputeventstream *evstream; 
+    struct dbl_pool *pool;
+    struct evbuffer *buffer;
+    struct dbl_mq_acceptqueue *queue;
+
+    pool = dbl_httpserver_request_get_pool(req);
+
+    evstream = dbl_pool_alloc(pool, sizeof(struct dbl_module_http_outputeventstream));
+    if (evstream == NULL)
+        return NULL;
+    
+    queue = dbl_mq_acceptqueue_create(pool, mctx->exchanger, routekey, flags);
+    if (evstream == NULL)
+        return NULL;
+
+    buffer = evbuffer_new();
+    if (buffer == NULL)
+        return NULL;
+
+    evstream->buffer = buffer;
+    evstream->eventsource = queue;
+    evstream->modulectx = mctx;
+    evstream->request = req;
+    evstream->buffer_watermark = DBL_MODULE_HTTP_OUTEVENTSTREAM_HIGHWM;
+    TAILQ_INSERT_TAIL(&mctx->eventlisteners, evstream, next);
+    return evstream;
+}
+
+static void dbl_module_http_destory_outputeventstream_(struct dbl_module_http_ctx *mctx, struct dbl_module_http_outputeventstream *evstream) {
+    dbl_mq_acceptqueue_destory(evstream->eventsource);
+    evbuffer_free(evstream->buffer);
+    TAILQ_REMOVE(&mctx->eventlisteners, evstream, next);
+}
+
+static void dbl_module_http_outputeventstream_fail_(struct dbl_module_http_outputeventstream *evstream, int closereq) {
+    if (closereq)
+        dbl_httpserver_close_request(evstream->request);
+
+    dbl_module_http_destory_outputeventstream_(evstream->modulectx, evstream);
+}
+
+static void dbl_module_http_outputeventstream_done_(struct dbl_module_http_outputeventstream *evstream) {
+    dbl_module_http_destory_outputeventstream_(evstream->modulectx, evstream);
+}
+
+static int dbl_module_http_outputeventstream_write_(struct dbl_module_http_outputeventstream *evstream, const struct dbl_mq_message *msg) {
+    struct evbuffer *buffer;
+    const char *lf;
+    const char *p, *last;
+
+    buffer = evstream->buffer;
+    if (msg->routekey) {
+        if (evbuffer_add(buffer, "event:", 6) == -1 ||
+            evbuffer_add(buffer, msg->routekey->fullpath, msg->routekey->length) == -1 ||
+            evbuffer_add(buffer, "\n", 1) == -1) {
+            return -1;
+        }
+    }
+
+    p = msg->data;
+    last = p + msg->size;
+    if (evbuffer_add(buffer, "data:", 5) == -1)
+        return -1;
+
+    while (p < last) {
+        lf = memchr(p, '\n', last - p);
+        if (lf == NULL) {
+            if (evbuffer_add(buffer, p, last - p) == -1)
+                return -1;
+
+            break;
+        }
+
+        if (evbuffer_add(buffer, p, lf - p) == -1)
+            return -1;
+        if (evbuffer_add(buffer, "\ndata:", 6) == -1)
+            return -1;
+
+        p = lf + 1;      
+    }
+
+    if (evbuffer_add(buffer, "\n\n", 2) == -1)
+        return -1;
+
+    return 0; 
+}
+
+static int dbl_module_http_outputeventstream_flush_(struct dbl_module_http_outputeventstream *evstream) {
+    struct evbuffer *outbody;
+
+    assert(evbuffer_get_length(evstream->buffer) > 0);
+
+    outbody = dbl_httpserver_request_get_output_body(evstream->request);
+    if (evstream->buffer_watermark) {
+        if (evbuffer_remove_buffer(evstream->buffer, outbody, evstream->buffer_watermark) <= 0)
+            return -1;
+    }
+    else {
+        if (evbuffer_add_buffer(outbody, evstream->buffer) == -1)
+            return -1;
+    }
+
+    return dbl_httpserver_send_response_body(evstream->request);
+}
+
+static void dbl_module_http_outputeventstream_end_(struct dbl_module_http_outputeventstream *evstream) {
+    if (dbl_httpserver_send_response_end(evstream->request) == -1)
+        dbl_module_http_outputeventstream_fail_(evstream, 1);
+}
+
+static void dbl_module_http_outputeventstream_on_acceptqueue_event_cb_(struct dbl_mq_acceptqueue *queue, short events, void *data) {
+    struct dbl_module_http_outputeventstream *evstream;
+    const struct dbl_mq_message sysmsg_excluded = { "excluded", 8, NULL, NULL, NULL, NULL};
+    struct dbl_mq_message *msg;
+
+    evstream = data;
+    /* The queue has unsent messages */
+    if (dbl_mq_acceptqueue_count(queue) > 0) {
+        while ((msg = dbl_mq_acceptqueue_dequeue(queue))) {
+            if (dbl_module_http_outputeventstream_write_(evstream, msg) == -1)
+                goto error;
+
+            dbl_mq_destroy_message(msg);
+        }
+    }
+
+    /* Write double-event 'excluded' */
+    if (events & DBL_MQ_ACPTQUEUE_EVENT_EXCLUDED) {
+        if (dbl_module_http_outputeventstream_write_(evstream, &sysmsg_excluded) == -1)
+            goto error;
+    }
+
+    if (dbl_module_http_outputeventstream_flush_(evstream) == -1)
+        goto error;
+
+    if (events & DBL_MQ_ACPTQUEUE_EVENT_CLOSED) 
+        dbl_module_http_outputeventstream_end_(evstream);
+
+    return;
+
+error:
+    dbl_module_http_outputeventstream_fail_(evstream, 1);
+}
+
+static void dbl_module_http_outputeventstream_on_acceptqueue_data_cb_(struct dbl_mq_acceptqueue *queue, void *data) {
+    struct dbl_mq_message *msg;
+    struct dbl_module_http_outputeventstream *evstream;
+    struct dbl_module_http_ctx *mctx;
+    struct dbl_httpserver_connection *conn;
+    const struct sockaddr *addr;
+    char ipaddr[DBL_IPADDRSTRMAXLEN];
+    uint16_t port;
+    
+    assert(dbl_mq_acceptqueue_count(queue) > 0);
+    evstream = data;
+
+    /* Dequeue message from queue for send */
+    while ((msg = dbl_mq_acceptqueue_dequeue(queue))) {
+        if (dbl_module_http_outputeventstream_write_(evstream, msg) == -1)
+            goto error;
+
+        dbl_mq_destroy_message(msg);
+        if (evstream->buffer_watermark && evbuffer_get_length(evstream->buffer) >= evstream->buffer_watermark) {
+            mctx = evstream->modulectx;
+            conn = dbl_httpserver_request_get_connection(evstream->request);
+            addr = dbl_httpserver_connection_get_sockaddr(conn);
+            dbl_parse_socketaddr(addr, ipaddr, DBL_IPADDRSTRMAXLEN, &port);
+
+            /* output warning to log */
+            dbl_log_error(DBL_LOG_WARNING, mctx->log, 0, "buffer of output eventstream over water mark (%zu bytes), accpet queue total size (%zu bytes) '%s:%d'", 
+                          evbuffer_get_length(evstream->buffer),
+                          dbl_mq_acceptqueue_size(queue),
+                          ipaddr,
+                          port);
+
+            /* now, we don't care about the messages of accept queue */
+            dbl_mq_acceptqueue_set_cbs(queue, NULL, dbl_module_http_outputeventstream_on_acceptqueue_event_cb_, evstream);
+            break;
+        }
+    }
+
+    if (dbl_module_http_outputeventstream_flush_(evstream) == -1)
+        goto error;
+
+    return;
+
+error:
+    dbl_module_http_outputeventstream_fail_(evstream, 1);
+}
+
+static void dbl_module_http_outputeventstream_on_request_output_body_cb_(struct dbl_httpserver_request *req, void *data) {
+    struct dbl_module_http_outputeventstream *evstream;
+    struct dbl_mq_acceptqueue *queue;
+
+    evstream = data;
+    /* Go on to flush */ 
+    if (evbuffer_get_length(evstream->buffer) > 0) {
+        if (dbl_module_http_outputeventstream_flush_(evstream) == -1)
+            dbl_module_http_outputeventstream_fail_(evstream, 1);
+
+        return;
+    }
+
+    queue = evstream->eventsource;
+    dbl_mq_acceptqueue_set_cbs(queue,
+                               dbl_module_http_outputeventstream_on_acceptqueue_data_cb_,
+                               dbl_module_http_outputeventstream_on_acceptqueue_event_cb_,
+                               evstream);
+
+    if (dbl_mq_acceptqueue_count(queue) > 0) {
+        dbl_module_http_outputeventstream_on_acceptqueue_data_cb_(queue, evstream);
+        return;
+    }
+}
+
+static void dbl_module_http_outputeventstream_on_request_output_error_cb_(const struct dbl_httpserver_request *req, enum dbl_http_error error, void *data) {
+    dbl_module_http_outputeventstream_fail_(data, 0);
+}
+
+static void dbl_module_http_outputeventstream_on_request_output_message_complete_cb_(struct dbl_httpserver_request *req, void *data) {
+    dbl_module_http_outputeventstream_done_(data);
+}
+
+static void dbl_module_http_send_error_(struct dbl_module_http_ctx *mctx, struct dbl_httpserver_request *req, enum dbl_http_status status) {
+    if (dbl_httpserver_send_response_errorpage(req, status) == -1)
+        dbl_httpserver_close_request(req);
+}
+
+static void dbl_module_http_send_eventstream_(struct dbl_module_http_ctx *mctx, struct dbl_httpserver_request *req, struct dbl_mq_routekey *routekey, int flags) {
+    struct dbl_module_http_outputeventstream *evstream;
+    struct dbl_http_form *outheaders;
+
+    evstream = dbl_module_http_create_outputeventstream_(mctx, req, routekey, flags);
+    if (evstream == NULL)
+        goto error;
+    
+    switch (dbl_mq_acceptqueue_enable(evstream->eventsource)) {
+        case DBL_MQ_BIND_OK:
+            break;
+        case DBL_MQ_BIND_RESOURCE_LOCKED:
+            dbl_module_http_send_error_(mctx, req, DHTTP_STATUS_LOCKED);
+            dbl_module_http_destory_outputeventstream_(mctx, evstream);
+            return;
+        default:
+            goto error;
+    }
+    
+    dbl_mq_acceptqueue_set_cbs(evstream->eventsource,
+                               dbl_module_http_outputeventstream_on_acceptqueue_data_cb_,
+                               dbl_module_http_outputeventstream_on_acceptqueue_event_cb_,
+                               evstream);
+
+    /* Send response headers */
+    outheaders = dbl_httpserver_request_get_output_headers(req);
+    if (dbl_http_form_add(outheaders, "Content-Type", "text/event-stream;charset=utf-8") == -1)
+        goto error;
+
+    if (dbl_httpserver_send_response_start(req, DHTTP_STATUS_OK, NULL) == -1)
+        goto error;
+
+    dbl_httpserver_request_set_output_timeout(req, NULL);
+    dbl_httpserver_request_set_output_cbs(req,
+                                          dbl_module_http_outputeventstream_on_request_output_body_cb_,
+                                          dbl_module_http_outputeventstream_on_request_output_message_complete_cb_,
+                                          dbl_module_http_outputeventstream_on_request_output_error_cb_,
+                                          evstream);
+    
+    return;
+
+error:
+    if (evstream)
+        dbl_module_http_destory_outputeventstream_(mctx, evstream);
+
+    dbl_httpserver_close_request(req);
+}
+
+static int dbl_module_http_cors_(struct dbl_module_http_ctx *mctx, struct dbl_httpserver_request *req) {
+    struct dbl_http_form *inheaders;
+    struct dbl_http_form *outheaders;
+    const struct dbl_array *allow_cors_origins;
+    const char *origin;
+    const char *val;
+
+    allow_cors_origins = &mctx->config.cors.origins;
+    if (allow_cors_origins->length == 0)
+        return 0;
+
+    inheaders = dbl_httpserver_request_get_input_headers(req);
+    origin = dbl_http_form_find(inheaders, "origin");
+    if (origin == NULL)
+        return 0;
+
+    outheaders = dbl_httpserver_request_get_output_headers(req);
+    for (unsigned i = 0; i < allow_cors_origins->length; i++) {
+        val = dbl_array_elementat(allow_cors_origins, i, char *);
+        if (strcmp(val, "*") || dbl_strcasecmp(val, origin) == 0) {
+            return dbl_http_form_add_reference(outheaders, "Access-Control-Allow-Origin", origin);
+        }
+    }
+    return 0;
+}
+
 static int dbl_module_http_compare_pair_greater_(const struct dbl_http_pair *a, const struct dbl_http_pair *b) {
     return strcmp(a->key, b->key) > 0 ? 1: 0;
 }
@@ -548,164 +864,6 @@ static int dbl_module_http_verify_signature_(struct dbl_module_http_ctx *mctx, s
     return strcmp(mdstr, in_mdstr) == 0? 0: -1; 
 }
 
-static int dbl_module_http_write_eventstream_event_(struct dbl_httpserver_request *req, const struct dbl_mq_routekey *routekey, const char *eventdata, size_t size) {
-    struct evbuffer *outbody;
-    const char *lf;
-    const char *p, *last;
-
-    outbody = dbl_httpserver_request_get_output_body(req);
-
-    if (routekey) {
-        if (evbuffer_add(outbody, "event:", 6) == -1 ||
-            evbuffer_add(outbody, routekey->fullpath, routekey->length) == -1 ||
-            evbuffer_add(outbody, "\n", 1) == -1) {
-            return -1;
-        }
-    }
-
-    p = eventdata;
-    last = p + size;
-    if (evbuffer_add(outbody, "data:", 5) == -1)
-        return -1;
-
-    while (p < last) {
-        lf = memchr(p, '\n', last - p);
-        if (lf == NULL) {
-            if (evbuffer_add(outbody, p, last - p) == -1)
-                return -1;
-
-            break;
-        }
-
-        if (evbuffer_add(outbody, p, lf - p) == -1)
-            return -1;
-        if (evbuffer_add(outbody, "\ndata:", 6) == -1)
-            return -1;
-
-        p = lf + 1;      
-    }
-
-    if (evbuffer_add(outbody, "\n\n", 2) == -1)
-        return -1;
-
-    return 0; 
-}
-
-static void dbl_module_http_send_eventstream_done_(struct dbl_httpserver_request *req, void *data) {
-    struct dbl_mq_acceptqueue *queue = data;
-
-    assert(dbl_mq_acceptqueue_count(queue) == 0);
-    dbl_mq_delete_acceptqueue(queue);
-}
-
-static void dbl_module_http_send_eventstream_fail_(const struct dbl_httpserver_request *req, enum dbl_http_error error, void *data) {
-    struct dbl_mq_acceptqueue *queue = data;
-
-    dbl_mq_delete_acceptqueue(queue);
-}
-
-static void dbl_module_http_send_eventstream_event_(struct dbl_mq_acceptqueue *queue, short events, void *data) {
-    struct dbl_httpserver_request *req;
-    struct dbl_mq_message *msg;
-
-    req = data;
-    if (events & DBL_MQ_ACPTQUEUE_EVENT_READ) {
-        /* Dequeue message from queue for send */
-        while ((msg = dbl_mq_acceptqueue_dequeue(queue))) {
-            if (dbl_module_http_write_eventstream_event_(req, msg->routekey, msg->data, msg->size) == -1)
-                goto error;
-
-            dbl_mq_destroy_message(msg);
-        }
-
-        if (dbl_httpserver_send_response_body(req) == -1)
-            goto error;
-    }
-
-    if (events & DBL_MQ_ACPTQUEUE_EVENT_EXCLUDED) {
-        if (dbl_module_http_write_eventstream_event_(req, NULL, "excluded", 8) == -1)
-            goto error;
-        
-        if (dbl_httpserver_send_response_body(req) == -1)
-            goto error;
-    }
-
-    if (events & DBL_MQ_ACPTQUEUE_EVENT_CLOSED) {
-        if (dbl_httpserver_send_response_end(req) == -1)
-            goto error;
-    }
-
-    return;
-
-error:
-    dbl_module_http_send_eventstream_fail_(req, DHTTP_BUFFER_ERROR, queue);
-    dbl_httpserver_close_request(req);
-}
-
-static int dbl_module_http_start_send_eventstream_(struct dbl_module_http_ctx *mctx, struct dbl_httpserver_request *req, struct dbl_mq_acceptqueue *queue) { 
-    struct dbl_http_form *outheaders;
-
-    /* Set output headers */ 
-    outheaders = dbl_httpserver_request_get_output_headers(req);
-    if (dbl_http_form_add(outheaders, "Content-Type", "text/event-stream;charset=utf-8") == -1)
-        return -1;
-
-    dbl_httpserver_request_set_output_timeout(req, NULL);
-    dbl_httpserver_request_set_output_cbs(req,
-                                          NULL,
-                                          dbl_module_http_send_eventstream_done_,
-                                          dbl_module_http_send_eventstream_fail_,
-                                          queue);
-    
-    /* Send response firstline and headers */
-    if (dbl_httpserver_send_response_start(req, DHTTP_STATUS_OK, NULL) == -1)
-        return -1;
-    
-    dbl_mq_acceptqueue_set_event_cb(queue, dbl_module_http_send_eventstream_event_, req);
-    if (dbl_mq_acceptqueue_enable_event(queue) == -1) 
-        return -1;
-
-    return 0;
-}
-
-static int dbl_module_http_before_process_request_(struct dbl_module_http_ctx *mctx, struct dbl_httpserver_request *req) {
-    struct dbl_http_form *inheaders;
-    struct dbl_http_form *outheaders;
-    const struct dbl_array *allow_cors_origins;
-    const char *origin;
-    const char *val;
-
-    allow_cors_origins = &mctx->config.cors.origins;
-    if (allow_cors_origins->length == 0)
-        return 0;
-
-    inheaders = dbl_httpserver_request_get_input_headers(req);
-    origin = dbl_http_form_find(inheaders, "origin");
-    if (origin == NULL)
-        return 0;
-
-    outheaders = dbl_httpserver_request_get_output_headers(req);
-    for (unsigned i = 0; i < allow_cors_origins->length; i++) {
-        val = dbl_array_elementat(allow_cors_origins, i, char *);
-        if (strcmp(val, "*") || dbl_strcasecmp(val, origin) == 0) {
-            return dbl_http_form_add_reference(outheaders, "Access-Control-Allow-Origin", origin);
-        }
-    }
-    return 0;
-}
-
-static void dbl_module_http_start_process_request_(struct dbl_module_http_ctx *mctx, struct dbl_httpserver_request *req, dbl_module_http_request_handler handler) {
-    if (dbl_module_http_before_process_request_(mctx, req) == -1)
-        goto error;
-
-    if (handler(mctx, req) == -1)
-        goto error;
-
-    return;
-
-error:
-    dbl_httpserver_close_request(req);
-}
 
 static void dbl_module_http_route_handler_(struct dbl_httpserver_request *req, void *data) {
     struct dbl_module_http_ctx *mctx; 
@@ -713,7 +871,6 @@ static void dbl_module_http_route_handler_(struct dbl_httpserver_request *req, v
     const struct dbl_http_uri *uri;
     const struct dbl_http_form *inheaders;
     const char *fval;
-    enum dbl_http_status err;
 
     mctx = data;
     uri = dbl_httpserver_request_get_uri(req);
@@ -723,15 +880,15 @@ static void dbl_module_http_route_handler_(struct dbl_httpserver_request *req, v
     }
     
     /* Not found */
-    if (!route->request_handler) {
-        err = DHTTP_STATUS_NOT_FOUND;
-        goto error;
+    if (!route->request_action_handler) {
+        dbl_module_http_send_error_(mctx, req, DHTTP_STATUS_NOT_FOUND);
+        return;
     }
 
     /* Method not allowed */
     if (route->method != dbl_httpserver_request_get_method(req)) {
-        err = DHTTP_STATUS_METHOD_NOT_ALLOWED;
-        goto error;
+        dbl_module_http_send_error_(mctx, req, DHTTP_STATUS_METHOD_NOT_ALLOWED);
+        return;
     }
 
     /* Content type not allowed */
@@ -739,17 +896,23 @@ static void dbl_module_http_route_handler_(struct dbl_httpserver_request *req, v
         inheaders = dbl_httpserver_request_get_input_headers(req);
         fval = dbl_http_form_find(inheaders, "Content-Type");
         if (fval == NULL || dbl_strcasecmp(route->content_type, fval) != 0) { 
-            err = DHTTP_STATUS_UNSUPPORTED_MEDIA_TYPE; 
-            goto error;
+            dbl_module_http_send_error_(mctx, req, DHTTP_STATUS_UNSUPPORTED_MEDIA_TYPE);
+            return;
         }
     }
 
-    dbl_module_http_start_process_request_(mctx, req, route->request_handler);
+    /* Filters */
+    if (dbl_module_http_cors_(mctx, req) == -1)
+        goto closereq;
+
+    /* Request action handler */
+    if (route->request_action_handler(mctx, req) == -1)
+        goto closereq;
+
     return;
 
-error:
-    if (dbl_httpserver_send_response_errorpage(req, err) == -1)
-        dbl_httpserver_close_request(req);
+closereq:
+    dbl_httpserver_close_request(req);
 }
 
 static int dbl_module_http_process_home_request_(struct dbl_module_http_ctx *mctx, struct dbl_httpserver_request *req) {
@@ -773,59 +936,52 @@ static int dbl_module_http_process_event_trigger_request_(struct dbl_module_http
     const char *form_eventname;
     const char *form_eventdata;
     struct dbl_mq_routekey dstrk;
-    enum dbl_http_status status;
 
     pool = dbl_httpserver_request_get_pool(req);
     ibody = dbl_httpserver_request_get_input_body(req);
     ibodylen = evbuffer_get_length(ibody);
     if (ibodylen == 0) {
-        status = DHTTP_STATUS_BAD_REQUEST;
-        goto errorpage;
+        dbl_module_http_send_error_(mctx, req, DHTTP_STATUS_BAD_REQUEST);
+        return 0;
     }
 
     ibodystr = dbl_pool_alloc(pool, ibodylen);
-    if (ibodystr == NULL) {
-        status = DHTTP_STATUS_SERVICE_UNAVAILABLE;
-        goto errorpage;
-    }
+    if (ibodystr == NULL)
+        return -1;
     evbuffer_remove(ibody, ibodystr, ibodylen);
     
     dbl_http_form_init(&form, pool);
     if (dbl_http_form_parse_formdata(&form, ibodystr, ibodylen, 1) == -1) {
-        status = DHTTP_STATUS_BAD_REQUEST;
-        goto errorpage;
+        dbl_module_http_send_error_(mctx, req, DHTTP_STATUS_BAD_REQUEST);
+        return 0;
     }
 
     if (dbl_module_http_verify_signature_(mctx, &form) != 0) {
-        status = DHTTP_STATUS_UNAUTHORIZED;
-        goto errorpage;
+        dbl_module_http_send_error_(mctx, req, DHTTP_STATUS_UNAUTHORIZED);
+        return 0;
     }
 
     /* What event the user want to trigger */
     form_eventname = dbl_http_form_find(&form, "event");
     if (form_eventname == NULL || dbl_mq_routekey_parse(&dstrk, form_eventname, strlen(form_eventname)) == -1) {
-        status = DHTTP_STATUS_BAD_REQUEST;
-        goto errorpage;
+        dbl_module_http_send_error_(mctx, req, DHTTP_STATUS_BAD_REQUEST);
+        return 0;
     }
 
     /* The event data */
     form_eventdata = dbl_http_form_find(&form, "data");
     if (!form_eventdata || strlen(form_eventdata) == 0) {
-        status = DHTTP_STATUS_BAD_REQUEST;
-        goto errorpage;
+        dbl_module_http_send_error_(mctx, req, DHTTP_STATUS_BAD_REQUEST);
+        return 0;
     }
 
     /* Exchanger forward data for trigger the specific event  */
     if (dbl_mq_exchanger_forward(mctx->exchanger, &dstrk, form_eventdata, strlen(form_eventdata), 0) == -1) {
-        dbl_log_error(DBL_LOG_WARN, mctx->log, 0, "trigger event '%s' error (%zu bytes)", form_eventname, strlen(form_eventdata));
-        status = DHTTP_STATUS_SERVICE_UNAVAILABLE;
-        goto errorpage;
+        dbl_log_error(DBL_LOG_WARNING, mctx->log, 0, "trigger event '%s' error (%zu bytes)", form_eventname, strlen(form_eventdata));
+        return -1;
     }
 
     return dbl_httpserver_send_response(req, DHTTP_STATUS_NO_CONTENT, NULL);
-
-errorpage:
-    return dbl_httpserver_send_response_errorpage(req, status);
 }
 
 static int dbl_module_http_process_event_listen_request_(struct dbl_module_http_ctx *mctx, struct dbl_httpserver_request *req) {
@@ -834,74 +990,50 @@ static int dbl_module_http_process_event_listen_request_(struct dbl_module_http_
     struct dbl_http_form form;
     const char *form_eventname;
     const char *form_exclusive;
-
     struct dbl_mq_routekey srcrk;
-    enum dbl_http_status status;
-
-    struct dbl_mq_acceptqueue *queue = NULL;
-    int qflags = 0;
-    enum dbl_mq_acceptqueue_bind_error qberr;
+    int flags = DBL_MQ_ACPTQUEUE_FLAG_DEFER_CALLBACK;
 
     uri = dbl_httpserver_request_get_uri(req);
     if (uri->query == NULL) {
-        status = DHTTP_STATUS_BAD_REQUEST;
-        goto errorpage;
+        dbl_module_http_send_error_(mctx, req, DHTTP_STATUS_BAD_REQUEST);
+        return 0;
     }
 
     pool = dbl_httpserver_request_get_pool(req);
     dbl_http_form_init(&form, pool);
     if (dbl_http_form_parse_formdata(&form, uri->query, strlen(uri->query), 1) == -1) {
-        status = DHTTP_STATUS_BAD_REQUEST;
-        goto errorpage;
+        dbl_module_http_send_error_(mctx, req, DHTTP_STATUS_BAD_REQUEST);
+        return 0;
     }
     
     if (dbl_module_http_verify_signature_(mctx, &form) != 0) {
-        status = DHTTP_STATUS_UNAUTHORIZED;
-        goto errorpage;
+        dbl_module_http_send_error_(mctx, req, DHTTP_STATUS_UNAUTHORIZED);
+        return 0;
     }
 
     /* What event the user want to listen */
     form_eventname = dbl_http_form_find(&form, "event");
     if (form_eventname == NULL || dbl_mq_routekey_parse(&srcrk, form_eventname, strlen(form_eventname)) == -1) {
-        status = DHTTP_STATUS_BAD_REQUEST;
-        goto errorpage;
+        dbl_module_http_send_error_(mctx, req, DHTTP_STATUS_BAD_REQUEST);
+        return 0;
     }
 
     /* The event doesn't allow other user to listen */
     form_exclusive = dbl_http_form_find(&form, "exclusive");
     if (form_exclusive) {
         if (strcmp(form_exclusive, "1") == 0)
-            qflags |= DBL_MQ_ACPTQUEUE_FLAG_EXCLUSIVE;
+            flags |= DBL_MQ_ACPTQUEUE_FLAG_EXCLUSIVE;
         else if (strcmp(form_exclusive, "0") != 0) {
-            status = DHTTP_STATUS_BAD_REQUEST;
-            goto errorpage;
+            dbl_module_http_send_error_(mctx, req, DHTTP_STATUS_BAD_REQUEST);
+            return 0;
         }
     }
 
-    queue = dbl_mq_create_acceptqueue(pool, mctx->exchanger, qflags);
-    if (queue == NULL) {
-        status = DHTTP_STATUS_SERVICE_UNAVAILABLE;
-        goto errorpage;
-    }
-
-    qberr = dbl_mq_acceptqueue_bind(queue, &srcrk);
-    switch(qberr) {
-        case DBL_MQ_ACPTQUEUE_BIND_RESOURCE_LOCKED:
-            status = DHTTP_STATUS_LOCKED;
-            break;
-        case DBL_MQ_ACPTQUEUE_BIND_MEMORY_ERROR:
-            status = DHTTP_STATUS_SERVICE_UNAVAILABLE;
-            break;
-        default:
-            dbl_module_http_start_send_eventstream_(mctx, req, queue); 
-            return 0;
-    }
-
-errorpage:
-    return dbl_httpserver_send_response_errorpage(req, status);
+    dbl_module_http_send_eventstream_(mctx, req, &srcrk, flags);
+    return 0;
 }
 
-static const char *dbl_module_http_httperrorstr_(enum dbl_http_error error) {
+static const char *dbl_module_http_str_httperror_(enum dbl_http_error error) {
     switch (error) {
         case DHTTP_INVALID_CONTEXT:
             return "invalid context";
@@ -933,12 +1065,11 @@ static void dbl_module_http_log_request_error_(const struct dbl_httpserver_reque
     const char *errstr;
 
     mctx = data;
-    /* Get ip and port from sockaddr */
     conn = dbl_httpserver_request_get_connection(req);
     addr = dbl_httpserver_connection_get_sockaddr(conn);
     dbl_parse_socketaddr(addr, ipaddr, DBL_IPADDRSTRMAXLEN, &port);
 
-    errstr = dbl_module_http_httperrorstr_(error);
+    errstr = dbl_module_http_str_httperror_(error);
     url = dbl_httpserver_request_get_url(req);
     if (url == NULL) {  
         dbl_log_error(DBL_LOG_ERROR, mctx->log, 0, "http request error (%s) '%s:%d'",errstr, ipaddr, port);
@@ -966,7 +1097,7 @@ static void dbl_module_http_log_response_error_(const struct dbl_httpserver_requ
     addr = dbl_httpserver_connection_get_sockaddr(conn);
     dbl_parse_socketaddr(addr, ipaddr, DBL_IPADDRSTRMAXLEN, &port);
 
-    errstr = dbl_module_http_httperrorstr_(error);
+    errstr = dbl_module_http_str_httperror_(error);
     url = dbl_httpserver_request_get_url(req);
     method = dbl_httpserver_request_get_method(req);
     status = dbl_httpserver_request_get_status(req);

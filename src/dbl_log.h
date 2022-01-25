@@ -5,7 +5,7 @@
 
 #define DBL_LOG_LEVEL_MAP(XX)   \
 XX(INFO     ,   1)              \
-XX(WARN     ,   2)              \
+XX(WARNING  ,   2)              \
 XX(ERROR    ,   3)              \
 XX(DEBUG    ,   4)              \
 

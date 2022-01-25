@@ -14,7 +14,7 @@ if(NOT DOUBLE_INSTALL_PREFIX)
 endif()
 
 set(DOUBLE_PID_PATH         ${DOUBLE_INSTALL_PREFIX}/double.pid)
-set(DOUBLE_CONFIG_PATH      ${DOUBLE_INSTALL_PREFIX}/double.conf)
+set(DOUBLE_CONFIG_PATH      ${DOUBLE_INSTALL_PREFIX}/config.yaml)
 set(DOUBLE_ERRORLOG_PATH    ${DOUBLE_INSTALL_PREFIX}/error.log)
 set(DOUBLE_ACCESSLOG_PATH   ${DOUBLE_INSTALL_PREFIX}/access.log)
 
@@ -46,8 +46,8 @@ configure_file(
 
 # Generate the application configure file 
 configure_file(
-    ${PROJECT_SOURCE_DIR}/double.conf.cmake
-    ${PROJECT_BINARY_DIR}/double.conf)
+    ${PROJECT_SOURCE_DIR}/config.yaml.cmake
+    ${PROJECT_BINARY_DIR}/config.yaml)
 
 aux_source_directory(src PROJECT_SOURCE_FILES)
 aux_source_directory(src/modules PROJECT_SOURCE_FILES)
@@ -68,7 +68,7 @@ target_link_libraries(double
 
 install(
     FILES 
-    ${CMAKE_CURRENT_BINARY_DIR}/double.conf
+    ${PROJECT_BINARY_DIR}/config.yaml
     DESTINATION ${DOUBLE_INSTALL_PREFIX}
     )
 install(

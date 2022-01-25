@@ -124,6 +124,13 @@ void dbl_httpserver_set_errorpages_provider(struct dbl_httpserver *server, dbl_h
  */
 void dbl_httpserver_set_connection_timeouts(struct dbl_httpserver *server, struct timeval *tv_read, struct timeval *tv_write);
 
+
+/**
+ * @brief Allocate specific size bytes from request, the memory will be
+ *        freed on the end of the request
+ */
+void *dbl_httpserver_request_alloc(struct dbl_httpserver_request *req, size_t size);
+
 /**
  * @brief Set output callbacks for request
  *

@@ -83,12 +83,13 @@ static void *dbl_pool_alloc_small_(struct dbl_pool *pool, size_t size) {
     m = dbl_pool_align(p->data.last);
     p->data.last = m + size;
 
-    for (last = pool->current; last->data.next; last = last->data.next) {
-        if (last->data.failed++ > 4) {
-            pool->current = last;
-        }
-    }
+    last = pool->current;
+    while (last->data.next != NULL) {
+        if (++last->data.failed >= 3)
+            pool->current = last->data.next;
 
+        last = last->data.next;
+    }
     last->data.next = p;
 
     return m;
@@ -141,10 +142,8 @@ void *dbl_pool_alloc(struct dbl_pool *pool, size_t size) {
 void *dbl_pool_calloc(struct dbl_pool *pool, size_t n, size_t size) {
     void *data;
 
-    if (n > SIZE_MAX / size) {
-        dbl_log_error(DBL_LOG_ERROR, pool->log, errno, "dbl_pool_alloc() overflow (n:%zu size:%zu)", n, size);
+    if (n > SIZE_MAX / size)
         return NULL;
-    }
 
     data = dbl_pool_alloc(pool, n * size);
     if (data == NULL)

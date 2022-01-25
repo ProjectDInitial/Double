@@ -71,8 +71,10 @@ struct dbl_mq_route {
     struct dbl_mq_acceptqueue_list      bound_queues;
 };
 
-#define DBL_MQ_ACPTQUEUE_FLAG_BOUND  (1 << 3)
-#define DBL_MQ_ACPTQUEUE_PRIVATE_FLAGS  DBL_MQ_ACPTQUEUE_FLAG_BOUND
+#define DBL_MQ_ACPTQUEUE_FLAG_BOUND            (1 << 2)
+#define DBL_MQ_ACPTQUEUE_FLAG_DEFER_DESTORY    (1 << 3)
+#define DBL_MQ_ACPTQUEUE_FLAG_NEEDS_DESTORY    (1 << 4)
+#define DBL_MQ_ACPTQUEUE_PRIVATE_FLAGS      (DBL_MQ_ACPTQUEUE_FLAG_BOUND | DBL_MQ_ACPTQUEUE_FLAG_DEFER_DESTORY | DBL_MQ_ACPTQUEUE_FLAG_NEEDS_DESTORY)
 
 struct dbl_mq_acceptqueue {
     /* A set of accept queue flags, see 'DBL_MQ_ACPTQUEUE_FLAG_*' */
@@ -82,17 +84,6 @@ struct dbl_mq_acceptqueue {
     struct dbl_mq_routekey                  routekey;
     struct dbl_mq_exchanger                *exchanger;
     
-    /* Accept queue event */ 
-    struct {
-        /* An event use for let the 'event_cb' run deferred in
-         * the event loop */
-        struct event                       *ev;
-
-        /* User event callback */
-        dbl_mq_acceptqueue_event_cb         user_event_cb;
-        void                               *user_event_cbarg;
-        short                               user_events;
-    } event;
 
     struct {
         struct dbl_mq_message              *header;
@@ -100,19 +91,30 @@ struct dbl_mq_acceptqueue {
     } messages[DBL_MQ_MESSAGE_PRIORITY_MAX + 1];
 
     unsigned int messages_count;
+    
+    /* Use on 'DBL_ACPTQUEUE_FLAG_DEFER_CALLBACKS'.
+     * The event use for let the callbacks run deferred in the event loop */
+    struct event                           *event;
+
+    /* The queue events was triggered */
+    short                                   events;
+    dbl_mq_acceptqueue_data_cb              data_cb;
+    dbl_mq_acceptqueue_event_cb             event_cb;
+    void                                   *cbarg;
 
     /* Queue binding informations (readonly) */
     struct dbl_mq_route                    *route;
     struct dbl_mq_acceptqueue             **prev;   /* Point to the next of the previous node */
     struct dbl_mq_acceptqueue              *next;   /* Point to the next node */
+    
 };
 
 static struct dbl_mq_route *dbl_mq_exchanger_open_route_(struct dbl_mq_exchanger *exchanger, const struct dbl_mq_routekey *routekey); 
 static void dbl_mq_exchanger_close_route_(struct dbl_mq_exchanger *exchanger, struct dbl_mq_route *route, int force); 
 static struct dbl_mq_message *dbl_mq_create_messages(unsigned int n, const char *data, size_t size, const struct dbl_mq_routekey *routekey, struct dbl_log *log); 
 static int dbl_mq_acceptqueue_enqueue_with_priority_(struct dbl_mq_acceptqueue *queue, struct dbl_mq_message *message, int priority); 
-static void dbl_mq_acceptqueue_event_cb_(evutil_socket_t fd, short events, void *data);
-static void dbl_mq_acceptqueue_trigger_event_deferred_(struct dbl_mq_acceptqueue *queue, short events);
+static void dbl_mq_acceptqueue_trigger_callbacks_(evutil_socket_t fd, short events, void *data);
+static void dbl_mq_acceptqueue_trigger_event_(struct dbl_mq_acceptqueue *queue, short events);
 
 static void dbl_mq_acceptqueue_list_init_(struct dbl_mq_acceptqueue_list *list) {
     list->header = NULL;
@@ -530,7 +532,7 @@ static void dbl_mq_exchanger_close_route_(struct dbl_mq_exchanger *exchanger, st
 
         while ((queue = dbl_mq_acceptqueue_list_first_(bounds) )) {
             dbl_mq_acceptqueue_list_remove_(bounds, queue);
-            dbl_mq_acceptqueue_trigger_event_deferred_(queue, DBL_MQ_ACPTQUEUE_EVENT_CLOSED);
+            dbl_mq_acceptqueue_trigger_event_(queue, DBL_MQ_ACPTQUEUE_EVENT_CLOSED);
         }
     }
 
@@ -547,38 +549,38 @@ static void dbl_mq_exchanger_close_route_(struct dbl_mq_exchanger *exchanger, st
     dbl_mq_route_free_(route);
 }
 
-static enum dbl_mq_acceptqueue_bind_error dbl_mq_exchanger_bind_queue_(struct dbl_mq_exchanger *exchanger, const struct dbl_mq_routekey *dst, struct dbl_mq_acceptqueue *queue) {
+static enum dbl_mq_bind_error dbl_mq_exchanger_bind_queue_(struct dbl_mq_exchanger *exchanger, const struct dbl_mq_routekey *dst, struct dbl_mq_acceptqueue *queue) {
     struct dbl_mq_route *route; 
     struct dbl_mq_acceptqueue_list *bounds;
     struct dbl_mq_acceptqueue *first;
 
     route = dbl_mq_exchanger_open_route_(exchanger, dst);
     if (route == NULL)
-        return DBL_MQ_ACPTQUEUE_BIND_MEMORY_ERROR;
+        return DBL_MQ_BIND_MEMORY_ERROR;
 
     bounds = dbl_mq_route_bounds_(route);
     if (queue->flags & DBL_MQ_ACPTQUEUE_FLAG_EXCLUSIVE) {
         /* Remove all queues on the route and trigger queue event */
         while ((first = dbl_mq_acceptqueue_list_first_(bounds))) {
             dbl_mq_acceptqueue_list_remove_(bounds, first);
-            dbl_mq_acceptqueue_trigger_event_deferred_(first, DBL_MQ_ACPTQUEUE_EVENT_CLOSED|DBL_MQ_ACPTQUEUE_EVENT_EXCLUDED);
+            dbl_mq_acceptqueue_trigger_event_(first, DBL_MQ_ACPTQUEUE_EVENT_CLOSED|DBL_MQ_ACPTQUEUE_EVENT_EXCLUDED);
         }
     }
     else {
         first = dbl_mq_acceptqueue_list_first_(bounds);
         if (first != NULL && first->flags & DBL_MQ_ACPTQUEUE_FLAG_EXCLUSIVE) {
             assert(dbl_mq_acceptqueue_list_count_(bounds) == 1);
-            return DBL_MQ_ACPTQUEUE_BIND_RESOURCE_LOCKED;
+            return DBL_MQ_BIND_RESOURCE_LOCKED;
         }
     }
 
     if (dbl_mq_acceptqueue_list_add_(bounds, queue) == -1) {
         dbl_mq_exchanger_close_route_(exchanger, route, 0);
-        return DBL_MQ_ACPTQUEUE_BIND_MEMORY_ERROR;
+        return DBL_MQ_BIND_MEMORY_ERROR;
     }
 
     queue->route = route;
-    return DBL_MQ_ACPTQUEUE_BIND_NO_ERROR;
+    return DBL_MQ_BIND_OK;
 }
 
 static void dbl_mq_exchanger_unbind_queue_(struct dbl_mq_exchanger *exchanger, struct dbl_mq_acceptqueue *queue) {
@@ -691,7 +693,7 @@ int dbl_mq_exchanger_forward(struct dbl_mq_exchanger *exchanger, const struct db
     for (unsigned int i = 0; i < array.length; i++) {
         for (queue = dbl_mq_acceptqueue_list_first_(bounds_array[i]); queue != NULL; queue = queue->next) {
             dbl_mq_acceptqueue_enqueue_with_priority_(queue, &messages[--n], priority); 
-            dbl_mq_acceptqueue_trigger_event_deferred_(queue, DBL_MQ_ACPTQUEUE_EVENT_READ);
+            dbl_mq_acceptqueue_trigger_event_(queue, DBL_MQ_ACPTQUEUE_EVENT_READ);
         }
     }
 
@@ -700,7 +702,7 @@ done:
     return res;
 }
 
-struct dbl_mq_acceptqueue *dbl_mq_create_acceptqueue(struct dbl_pool *pool, struct dbl_mq_exchanger *exchanger, int flags) {
+struct dbl_mq_acceptqueue *dbl_mq_acceptqueue_create(struct dbl_pool *pool, struct dbl_mq_exchanger *exchanger, const struct dbl_mq_routekey *routekey, int flags) {
     struct dbl_mq_acceptqueue *queue;
     struct event *ev;
 
@@ -709,99 +711,91 @@ struct dbl_mq_acceptqueue *dbl_mq_create_acceptqueue(struct dbl_pool *pool, stru
         return NULL;
     memset(queue, 0, sizeof(struct dbl_mq_acceptqueue));
 
-    ev = dbl_pool_alloc(pool, event_get_struct_event_size());
-    if (ev == NULL)
-        return NULL;
-
-    if (event_assign(ev, exchanger->evbase, -1, 0, dbl_mq_acceptqueue_event_cb_, queue) == -1)
-        return NULL;
-
+    ev = NULL;
     flags &= ~DBL_MQ_ACPTQUEUE_PRIVATE_FLAGS;
+    if (flags & DBL_MQ_ACPTQUEUE_FLAG_DEFER_CALLBACK) {
+        ev = dbl_pool_alloc(pool, event_get_struct_event_size());
+        if (ev == NULL ||
+            event_assign(ev, exchanger->evbase, -1, 0, dbl_mq_acceptqueue_trigger_callbacks_, queue) == -1 ||
+            event_add(ev, NULL) == -1)
+        {
+            return NULL;
+        }
+    }
+
     for (int i = 0; i < DBL_MQ_MESSAGE_PRIORITY_MAX; i++) { 
         queue->messages[i].header = NULL;
         queue->messages[i].tail = &queue->messages[i].header;
     }
-
+    queue->event = ev;
     queue->exchanger = exchanger;
-    queue->event.ev = ev;
     queue->flags = flags;
+    dbl_mq_routekey_copy(&queue->routekey, routekey);
     return queue;
 }
 
-void dbl_mq_delete_acceptqueue(struct dbl_mq_acceptqueue *queue) {
+void dbl_mq_acceptqueue_destory(struct dbl_mq_acceptqueue *queue) {
     struct dbl_mq_message *message;
 
-    dbl_mq_acceptqueue_unbind(queue);
-    dbl_mq_acceptqueue_disable_event(queue);
-    /* Clear all messages */
+    if (queue->flags & DBL_MQ_ACPTQUEUE_FLAG_DEFER_DESTORY) {
+        queue->flags |= DBL_MQ_ACPTQUEUE_FLAG_NEEDS_DESTORY;
+        return;
+    }
+
+    dbl_mq_acceptqueue_disable(queue);
+    /* Destroy all messages of the queue */
     while ((message = dbl_mq_acceptqueue_dequeue(queue)))
         dbl_mq_destroy_message(message);
+
+    if (queue->event)
+        event_del(queue->event);
+}
+
+void dbl_mq_acceptqueue_set_cbs(struct dbl_mq_acceptqueue *queue, dbl_mq_acceptqueue_data_cb data_cb, dbl_mq_acceptqueue_event_cb event_cb, void *cbarg) {
+    queue->data_cb = data_cb;
+    queue->event_cb = event_cb;
+    queue->cbarg = cbarg;
+}
+
+enum dbl_mq_bind_error dbl_mq_acceptqueue_enable(struct dbl_mq_acceptqueue *queue) {
+    enum dbl_mq_bind_error err;
+
+    if (queue->flags & DBL_MQ_ACPTQUEUE_FLAG_BOUND)
+        return DBL_MQ_BIND_OK;
+    
+    err = dbl_mq_exchanger_bind_queue_(queue->exchanger, &queue->routekey, queue);
+    if (err == DBL_MQ_BIND_OK)
+        queue->flags |= DBL_MQ_ACPTQUEUE_FLAG_BOUND;
+
+    return err;
+}
+
+void dbl_mq_acceptqueue_disable(struct dbl_mq_acceptqueue *queue) {
+    if (!(queue->flags & DBL_MQ_ACPTQUEUE_FLAG_BOUND))
+        return;
+
+    dbl_mq_exchanger_unbind_queue_(queue->exchanger, queue);
+    queue->flags &= ~DBL_MQ_ACPTQUEUE_FLAG_BOUND;
 }
 
 int dbl_mq_acceptqueue_count(const struct dbl_mq_acceptqueue *queue) {
     return queue->messages_count;
 }
 
-//struct dbl_mq_acceptqueue *dbl_mq_acceptqueue_new(struct dbl_mq_exchanger *exchanger, int flags) {
-//    struct dbl_mq_acceptqueue *queue;
-//    struct event *ev; 
-//
-//    queue = malloc(sizeof(struct dbl_mq_acceptqueue));
-//    if (queue == NULL) 
-//        return NULL;
-//    memset(queue, 0, sizeof(struct dbl_mq_acceptqueue));
-//
-//    ev = event_new(exchanger->evbase, -1, 0, dbl_mq_acceptqueue_event_cb_, queue);
-//    if (ev == NULL) {
-//        free(queue);
-//        return NULL;
-//    }
-//
-//    flags &= ~DBL_MQ_ACPTQUEUE_PRIVATE_FLAGS;
-//    for (int i = 0; i < DBL_MQ_MESSAGE_PRIORITY_MAX; i++) { 
-//        queue->messages[i].header = NULL;
-//        queue->messages[i].tail = &queue->messages[i].header;
-//    }
-//
-//    queue->exchanger = exchanger;
-//    queue->event.ev = ev;
-//    queue->flags = flags;
-//    return queue;
-//}
+size_t dbl_mq_acceptqueue_size(const struct dbl_mq_acceptqueue *queue) {
+    size_t totalsize;
+    const struct dbl_mq_message *first;
 
-void dbl_mq_acceptqueue_set_event_cb(struct dbl_mq_acceptqueue *queue, dbl_mq_acceptqueue_event_cb event_cb, void *cbarg) {
-    queue->event.user_event_cb = event_cb;
-    queue->event.user_event_cbarg = cbarg;
-}
-
-enum dbl_mq_acceptqueue_bind_error dbl_mq_acceptqueue_bind(struct dbl_mq_acceptqueue *queue, const struct dbl_mq_routekey *routekey) {
-    enum dbl_mq_acceptqueue_bind_error err;
-
-    if (queue->flags & DBL_MQ_ACPTQUEUE_FLAG_BOUND)
-        dbl_mq_acceptqueue_unbind(queue);
-
-    err = dbl_mq_exchanger_bind_queue_(queue->exchanger, routekey, queue);
-    if (err == DBL_MQ_ACPTQUEUE_BIND_NO_ERROR) {
-        queue->flags |= DBL_MQ_ACPTQUEUE_FLAG_BOUND;
-        dbl_mq_routekey_copy(&queue->routekey, routekey);
+    totalsize = 0;
+    for (int i = 0; i < DBL_MQ_MESSAGE_PRIORITY_MAX; i++) {
+        first = queue->messages[i].header;
+        while (first) {
+            totalsize += first->size;
+            first = first->next;
+        }
     }
-    return err;
-}
 
-void dbl_mq_acceptqueue_unbind(struct dbl_mq_acceptqueue *queue) {
-    if (!(queue->flags & DBL_MQ_ACPTQUEUE_FLAG_BOUND))
-        return;
-    
-    dbl_mq_exchanger_unbind_queue_(queue->exchanger, queue);
-    queue->flags &= ~DBL_MQ_ACPTQUEUE_FLAG_BOUND;
-}
-
-int dbl_mq_acceptqueue_enable_event(struct dbl_mq_acceptqueue *queue) {
-    return event_add(queue->event.ev, NULL);
-}
-
-void dbl_mq_acceptqueue_disable_event(struct dbl_mq_acceptqueue *queue) {
-    event_del(queue->event.ev);
+    return totalsize;
 }
 
 static int dbl_mq_acceptqueue_enqueue_with_priority_(struct dbl_mq_acceptqueue *queue, struct dbl_mq_message *message, int priority) {
@@ -818,12 +812,12 @@ static int dbl_mq_acceptqueue_enqueue_with_priority_(struct dbl_mq_acceptqueue *
 struct dbl_mq_message *dbl_mq_acceptqueue_dequeue(struct dbl_mq_acceptqueue *queue) {
     struct dbl_mq_message *first;
 
-    for (int priority = DBL_MQ_MESSAGE_PRIORITY_MAX; priority >= 0; priority--) {
-        first = queue->messages[priority].header;
+    for (int i = DBL_MQ_MESSAGE_PRIORITY_MAX; i >= 0; i--) {
+        first = queue->messages[i].header;
         if (first) {
-            queue->messages[priority].header = first->next;
+            queue->messages[i].header = first->next;
             if (first->next == NULL)
-                queue->messages[priority].tail = &queue->messages[priority].header;
+                queue->messages[i].tail = &queue->messages[i].header;
 
             queue->messages_count--;
             return first;
@@ -832,22 +826,39 @@ struct dbl_mq_message *dbl_mq_acceptqueue_dequeue(struct dbl_mq_acceptqueue *que
     return NULL;
 }
 
-static void dbl_mq_acceptqueue_event_cb_(evutil_socket_t fd, short events, void *data) {
-    struct dbl_mq_acceptqueue *queue = data;
+static void dbl_mq_acceptqueue_trigger_callbacks_(evutil_socket_t fd, short events, void *data) {
+    struct dbl_mq_acceptqueue *queue;
     
-    if (queue->event.user_event_cb) {
-        events = queue->event.user_events;
-        queue->event.user_events = 0;
-        queue->event.user_event_cb(queue, events, queue->event.user_event_cbarg);
+    queue = data;
+    events = queue->events;
+    if (events & DBL_MQ_ACPTQUEUE_EVENT_READ && queue->data_cb) { 
+        queue->flags |= DBL_MQ_ACPTQUEUE_FLAG_DEFER_DESTORY;
+        queue->data_cb(queue, queue->cbarg);
+        queue->flags &= ~DBL_MQ_ACPTQUEUE_FLAG_DEFER_DESTORY;
+        if (queue->flags & DBL_MQ_ACPTQUEUE_FLAG_NEEDS_DESTORY) {
+            dbl_mq_acceptqueue_destory(queue);
+            return;
+        }
     }
+
+    events &= ~DBL_MQ_ACPTQUEUE_EVENT_READ;
+    if (events && queue->event_cb) {
+        queue->event_cb(queue, events, queue->cbarg);
+    }
+    
+    queue->events = 0;
 }
 
-static void dbl_mq_acceptqueue_trigger_event_deferred_(struct dbl_mq_acceptqueue *queue, short events) {
+static void dbl_mq_acceptqueue_trigger_event_(struct dbl_mq_acceptqueue *queue, short events) {
     if (events & DBL_MQ_ACPTQUEUE_EVENT_CLOSED)
         queue->flags &= ~DBL_MQ_ACPTQUEUE_FLAG_BOUND;
 
-    queue->event.user_events |= events;
-    event_active(queue->event.ev, 0, 0);
+    queue->events |= events;
+    if (queue->flags & DBL_MQ_ACPTQUEUE_FLAG_DEFER_CALLBACK) {
+        event_active(queue->event, 0, 0);
+    } else {
+        dbl_mq_acceptqueue_trigger_callbacks_(0, 0, queue);
+    }
 }
 
 int dbl_mq_routekey_parse(struct dbl_mq_routekey *routekey, const char *str, size_t len) {
